@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fmt, rc::Rc};
 
 use crate::error::Result;
@@ -43,6 +43,10 @@ pub struct ModelConfig {
     pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
     pub ort_profile_dir: Option<PathBuf>,
     pub ort_profile_session: Option<String>,
+    /// Optional directory for ONNX Runtime optimized model artifacts.
+    /// When set, callers can save ORT's offline-optimized graph and reuse it
+    /// on subsequent loads to reduce session startup latency.
+    pub ort_optimized_model_cache_dir: Option<PathBuf>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
@@ -66,6 +70,10 @@ impl fmt::Debug for ModelConfig {
             .field("coreml_cache_dir", &self.coreml_cache_dir)
             .field("ort_profile_dir", &self.ort_profile_dir)
             .field("ort_profile_session", &self.ort_profile_session)
+            .field(
+                "ort_optimized_model_cache_dir",
+                &self.ort_optimized_model_cache_dir,
+            )
             .finish()
     }
 }
@@ -80,6 +88,7 @@ impl Default for ModelConfig {
             coreml_cache_dir: None,
             ort_profile_dir: None,
             ort_profile_session: None,
+            ort_optimized_model_cache_dir: None,
         }
     }
 }
@@ -129,15 +138,39 @@ impl ModelConfig {
         self
     }
 
+    pub fn with_ort_optimized_model_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ort_optimized_model_cache_dir = Some(path.into());
+        self
+    }
+
     pub(crate) fn ort_profile_path(&self, component: &str) -> Option<PathBuf> {
         let dir = self.ort_profile_dir.as_ref()?;
         let session = self.ort_profile_session.as_ref()?;
         Some(dir.join(format!("{session}-{component}.json")))
     }
 
+    pub(crate) fn ort_optimized_model_cache_dir(&self) -> Option<&Path> {
+        self.ort_optimized_model_cache_dir.as_deref()
+    }
+
     pub(crate) fn apply_to_session_builder(
         &self,
         builder: SessionBuilder,
+    ) -> Result<SessionBuilder> {
+        self.apply_to_session_builder_with_optimization(builder, GraphOptimizationPolicy::All)
+    }
+
+    pub(crate) fn apply_to_session_builder_for_cached_model(
+        &self,
+        builder: SessionBuilder,
+    ) -> Result<SessionBuilder> {
+        self.apply_to_session_builder_with_optimization(builder, GraphOptimizationPolicy::Disable)
+    }
+
+    fn apply_to_session_builder_with_optimization(
+        &self,
+        builder: SessionBuilder,
+        optimization: GraphOptimizationPolicy,
     ) -> Result<SessionBuilder> {
         #[cfg(any(
             feature = "cuda",
@@ -153,8 +186,12 @@ impl ModelConfig {
         use ort::logging::LogLevel;
         use ort::session::builder::GraphOptimizationLevel;
 
+        let optimization_level = match optimization {
+            GraphOptimizationPolicy::All => GraphOptimizationLevel::All,
+            GraphOptimizationPolicy::Disable => GraphOptimizationLevel::Disable,
+        };
         let mut builder = builder
-            .with_optimization_level(GraphOptimizationLevel::All)?
+            .with_optimization_level(optimization_level)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
         if self.ort_profile_dir.is_some() {
@@ -230,4 +267,10 @@ impl ModelConfig {
 
         Ok(builder)
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum GraphOptimizationPolicy {
+    All,
+    Disable,
 }

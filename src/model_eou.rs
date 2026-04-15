@@ -4,8 +4,9 @@ use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array2, Array3, Array4};
 use ort::session::{IoBinding, Session};
 use ort::value::{Outlet, Tensor, TensorRef, ValueType};
-use std::path::Path;
-use std::time::Instant;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EncoderCacheAbi {
@@ -30,6 +31,82 @@ impl EncoderLayout {
     fn projected_cache_layer_values(&self) -> usize {
         self.cache_len * self.hidden_size
     }
+}
+
+struct OptimizedModelCachePaths {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+}
+
+fn optimized_model_cache_paths(
+    exec_config: &ExecutionConfig,
+    component: &str,
+    source_path: &Path,
+) -> Result<Option<OptimizedModelCachePaths>> {
+    let Some(cache_dir) = exec_config.ort_optimized_model_cache_dir() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(cache_dir)?;
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_cache_path_component)
+        .unwrap_or_else(|| "model".to_string());
+    let key = optimized_model_cache_key(exec_config, component, source_path)?;
+    let filename = format!("{component}.{stem}.{key}.optimized.onnx");
+    Ok(Some(OptimizedModelCachePaths {
+        final_path: cache_dir.join(&filename),
+        temp_path: cache_dir.join(format!("{filename}.tmp")),
+    }))
+}
+
+fn optimized_model_cache_key(
+    exec_config: &ExecutionConfig,
+    component: &str,
+    source_path: &Path,
+) -> Result<String> {
+    let metadata = fs::metadata(source_path)?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    update_fnv1a(&mut hash, b"sayboard-parakeet-ort-cache-v1");
+    update_fnv1a(&mut hash, component.as_bytes());
+    update_fnv1a(&mut hash, source_path.to_string_lossy().as_bytes());
+    update_fnv1a(&mut hash, metadata.len().to_string().as_bytes());
+    update_fnv1a(&mut hash, modified_ns.to_string().as_bytes());
+    update_fnv1a(
+        &mut hash,
+        format!("{:?}", exec_config.execution_provider).as_bytes(),
+    );
+    update_fnv1a(&mut hash, exec_config.intra_threads.to_string().as_bytes());
+    update_fnv1a(&mut hash, exec_config.inter_threads.to_string().as_bytes());
+    update_fnv1a(&mut hash, ort::info().as_bytes());
+    Ok(format!("{hash:016x}"))
+}
+
+fn update_fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn sanitize_cache_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Encoder cache state for streaming inference
@@ -387,37 +464,120 @@ impl ParakeetEOUModel {
             "crate session builder begin elapsedMs={}",
             started_at.elapsed().as_millis()
         ));
-        // Load encoder
-        let builder = Session::builder()?;
-        android_log::info(format!(
-            "crate encoder builder created elapsedMs={}",
-            started_at.elapsed().as_millis()
-        ));
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        builder = builder.with_log_id("sayboard-parakeet-eou-encoder")?;
-        android_log::info(format!(
-            "crate encoder builder configured elapsedMs={} intraThreads={} interThreads={}",
-            started_at.elapsed().as_millis(),
-            exec_config.intra_threads,
-            exec_config.inter_threads
-        ));
-        if let Some(profile_path) = exec_config.ort_profile_path("encoder") {
+        let encoder_profile_path = exec_config.ort_profile_path("encoder");
+        let encoder_cache_paths =
+            optimized_model_cache_paths(&exec_config, "encoder", &encoder_path)?;
+        let build_encoder_session = |load_path: &Path,
+                                     use_cached_model: bool,
+                                     optimized_output_path: Option<&Path>|
+         -> Result<Session> {
+            let builder = Session::builder()?;
             android_log::info(format!(
-                "crate encoder profiling enabled path={}",
-                profile_path.display()
+                "crate encoder builder created elapsedMs={}",
+                started_at.elapsed().as_millis()
             ));
-            builder = builder.with_profiling(&profile_path)?;
+            let mut builder = if use_cached_model {
+                exec_config.apply_to_session_builder_for_cached_model(builder)?
+            } else {
+                exec_config.apply_to_session_builder(builder)?
+            };
+            builder = builder.with_log_id("sayboard-parakeet-eou-encoder")?;
+            android_log::info(format!(
+                "crate encoder builder configured elapsedMs={} intraThreads={} interThreads={} optimizedCacheLoad={}",
+                started_at.elapsed().as_millis(),
+                exec_config.intra_threads,
+                exec_config.inter_threads,
+                use_cached_model
+            ));
+            if let Some(profile_path) = encoder_profile_path.as_ref() {
+                android_log::info(format!(
+                    "crate encoder profiling enabled path={}",
+                    profile_path.display()
+                ));
+                builder = builder.with_profiling(profile_path)?;
+            }
+            if let Some(optimized_output_path) = optimized_output_path {
+                android_log::info(format!(
+                    "crate encoder optimized cache output path={}",
+                    optimized_output_path.display()
+                ));
+                builder = builder.with_optimized_model_path(optimized_output_path)?;
+            }
+            android_log::info(format!(
+                "crate encoder commit begin elapsedMs={} path={}",
+                started_at.elapsed().as_millis(),
+                load_path.display()
+            ));
+            let session = builder.commit_from_file(load_path)?;
+            android_log::info(format!(
+                "crate encoder commit end elapsedMs={}",
+                started_at.elapsed().as_millis()
+            ));
+            Ok(session)
+        };
+
+        let encoder = match encoder_cache_paths.as_ref() {
+            Some(paths) if paths.final_path.exists() => {
+                android_log::info(format!(
+                    "crate encoder optimized cache hit path={}",
+                    paths.final_path.display()
+                ));
+                match build_encoder_session(&paths.final_path, true, None) {
+                    Ok(session) => session,
+                    Err(err) => {
+                        android_log::error(format!(
+                            "crate encoder optimized cache load failed path={} error={}",
+                            paths.final_path.display(),
+                            err
+                        ));
+                        if let Err(remove_err) = fs::remove_file(&paths.final_path) {
+                            android_log::error(format!(
+                                "crate encoder optimized cache remove failed path={} error={}",
+                                paths.final_path.display(),
+                                remove_err
+                            ));
+                        }
+                        let _ = fs::remove_file(&paths.temp_path);
+                        build_encoder_session(&encoder_path, false, Some(&paths.temp_path))?
+                    }
+                }
+            }
+            Some(paths) => {
+                android_log::info(format!(
+                    "crate encoder optimized cache miss source={} path={}",
+                    encoder_path.display(),
+                    paths.final_path.display()
+                ));
+                let _ = fs::remove_file(&paths.temp_path);
+                build_encoder_session(&encoder_path, false, Some(&paths.temp_path))?
+            }
+            None => build_encoder_session(&encoder_path, false, None)?,
+        };
+        if let Some(paths) = encoder_cache_paths.as_ref() {
+            if paths.temp_path.exists() {
+                let _ = fs::remove_file(&paths.final_path);
+                match fs::rename(&paths.temp_path, &paths.final_path) {
+                    Ok(()) => {
+                        let size_bytes = fs::metadata(&paths.final_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        android_log::info(format!(
+                            "crate encoder optimized cache stored path={} sizeBytes={}",
+                            paths.final_path.display(),
+                            size_bytes
+                        ));
+                    }
+                    Err(err) => {
+                        android_log::error(format!(
+                            "crate encoder optimized cache store failed temp={} final={} error={}",
+                            paths.temp_path.display(),
+                            paths.final_path.display(),
+                            err
+                        ));
+                    }
+                }
+            }
         }
-        android_log::info(format!(
-            "crate encoder commit begin elapsedMs={} path={}",
-            started_at.elapsed().as_millis(),
-            encoder_path.display()
-        ));
-        let encoder = builder.commit_from_file(&encoder_path)?;
-        android_log::info(format!(
-            "crate encoder commit end elapsedMs={}",
-            started_at.elapsed().as_millis()
-        ));
         let encoder_input_names = encoder
             .inputs()
             .iter()
