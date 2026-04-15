@@ -43,6 +43,7 @@
 //! - Channels: Mono (stereo will be converted automatically)
 //! - Bit Depth: 16-bit PCM or 32-bit float
 
+mod android_log;
 mod audio;
 mod config;
 mod decoder;

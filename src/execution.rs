@@ -41,6 +41,8 @@ pub struct ModelConfig {
     pub intra_threads: usize,
     pub inter_threads: usize,
     pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
+    pub ort_profile_dir: Option<PathBuf>,
+    pub ort_profile_session: Option<String>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
@@ -62,6 +64,8 @@ impl fmt::Debug for ModelConfig {
                 },
             )
             .field("coreml_cache_dir", &self.coreml_cache_dir)
+            .field("ort_profile_dir", &self.ort_profile_dir)
+            .field("ort_profile_session", &self.ort_profile_session)
             .finish()
     }
 }
@@ -74,6 +78,8 @@ impl Default for ModelConfig {
             inter_threads: 1,
             configure: None,
             coreml_cache_dir: None,
+            ort_profile_dir: None,
+            ort_profile_session: None,
         }
     }
 }
@@ -113,6 +119,22 @@ impl ModelConfig {
         self
     }
 
+    pub fn with_ort_profiling(
+        mut self,
+        profile_dir: impl Into<PathBuf>,
+        session_name: impl Into<String>,
+    ) -> Self {
+        self.ort_profile_dir = Some(profile_dir.into());
+        self.ort_profile_session = Some(session_name.into());
+        self
+    }
+
+    pub(crate) fn ort_profile_path(&self, component: &str) -> Option<PathBuf> {
+        let dir = self.ort_profile_dir.as_ref()?;
+        let session = self.ort_profile_session.as_ref()?;
+        Some(dir.join(format!("{session}-{component}.json")))
+    }
+
     pub(crate) fn apply_to_session_builder(
         &self,
         builder: SessionBuilder,
@@ -128,12 +150,18 @@ impl ModelConfig {
             feature = "nnapi"
         ))]
         use ort::ep::CPU as CPUExecutionProvider;
+        use ort::logging::LogLevel;
         use ort::session::builder::GraphOptimizationLevel;
 
         let mut builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(GraphOptimizationLevel::All)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
+        if self.ort_profile_dir.is_some() {
+            builder = builder
+                .with_log_level(LogLevel::Verbose)?
+                .with_log_verbosity(1)?;
+        }
 
         builder = match self.execution_provider {
             ExecutionProvider::Cpu => builder,
