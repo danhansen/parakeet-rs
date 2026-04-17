@@ -668,6 +668,7 @@ impl ParakeetEOUModel {
 
         let encoder_path = {
             let litert_encoder = model_dir.join("encoder.tflite");
+            let litert_encoder_enabled = model_dir.join("encoder.tflite.enabled");
             let projected_kv_layered_fixed =
                 model_dir.join("encoder.projected_kv_cache.layered.fixed.onnx");
             let projected_kv_layered = model_dir.join("encoder.projected_kv_cache.layered.onnx");
@@ -679,15 +680,35 @@ impl ParakeetEOUModel {
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.posconst.onnx");
             let conservative_int8 =
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.onnx");
-            if litert_encoder.exists() {
+            if litert_encoder.exists() && litert_encoder_enabled.exists() {
                 android_log::info(format!(
-                    "crate encoder selection prefer raw-cache ONNX because LiteRT encoder exists path={}",
-                    litert_encoder.display()
+                    "crate encoder selection prefer raw-cache ONNX because LiteRT encoder is explicitly enabled path={} marker={}",
+                    litert_encoder.display(),
+                    litert_encoder_enabled.display()
                 ));
                 if fixed_raw_cache_int8.exists() {
                     fixed_raw_cache_int8
                 } else if fixed_raw_cache.exists() {
                     fixed_raw_cache
+                } else if posconst_int8.exists() {
+                    posconst_int8
+                } else if conservative_int8.exists() {
+                    conservative_int8
+                } else {
+                    model_dir.join("encoder.onnx")
+                }
+            } else if litert_encoder.exists() {
+                android_log::info(format!(
+                    "crate encoder selection ignoring LiteRT encoder without opt-in marker path={} marker={}",
+                    litert_encoder.display(),
+                    litert_encoder_enabled.display()
+                ));
+                if projected_kv_layered_fixed.exists() {
+                    projected_kv_layered_fixed
+                } else if projected_kv_layered.exists() {
+                    projected_kv_layered
+                } else if projected_kv_int8.exists() {
+                    projected_kv_int8
                 } else if posconst_int8.exists() {
                     posconst_int8
                 } else if conservative_int8.exists() {
