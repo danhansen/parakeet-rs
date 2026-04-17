@@ -975,10 +975,19 @@ impl ParakeetEOUModel {
             "crate encoder io binding ready elapsedMs={}",
             started_at.elapsed().as_millis()
         ));
-        let litert_encoder = LiteRtEncoderBackend::create(
-            &model_dir.join("encoder.tflite"),
-            exec_config.intra_threads,
-        )?;
+        let litert_encoder_path = model_dir.join("encoder.tflite");
+        let litert_encoder = if encoder_cache_abi == EncoderCacheAbi::RawChannel {
+            LiteRtEncoderBackend::create(&litert_encoder_path, exec_config.intra_threads)?
+        } else {
+            if litert_encoder_path.exists() {
+                android_log::info(format!(
+                    "crate litert encoder unavailable path={} reason=incompatible_encoder_abi abi={:?}",
+                    litert_encoder_path.display(),
+                    encoder_cache_abi
+                ));
+            }
+            None
+        };
 
         // Load decoder
         let builder = Session::builder()?;
