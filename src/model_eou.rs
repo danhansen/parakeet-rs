@@ -672,6 +672,9 @@ impl ParakeetEOUModel {
                 model_dir.join("encoder.projected_kv_cache.layered.fixed.onnx");
             let projected_kv_layered = model_dir.join("encoder.projected_kv_cache.layered.onnx");
             let projected_kv_int8 = model_dir.join("encoder.projected_kv_cache.onnx");
+            let fixed_raw_cache_int8 =
+                model_dir.join("encoder.fixed_raw_cache.dynamic_int8.matmul_gemm.onnx");
+            let fixed_raw_cache = model_dir.join("encoder.fixed_raw_cache.onnx");
             let posconst_int8 =
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.posconst.onnx");
             let conservative_int8 =
@@ -681,7 +684,11 @@ impl ParakeetEOUModel {
                     "crate encoder selection prefer raw-cache ONNX because LiteRT encoder exists path={}",
                     litert_encoder.display()
                 ));
-                if posconst_int8.exists() {
+                if fixed_raw_cache_int8.exists() {
+                    fixed_raw_cache_int8
+                } else if fixed_raw_cache.exists() {
+                    fixed_raw_cache
+                } else if posconst_int8.exists() {
                     posconst_int8
                 } else if conservative_int8.exists() {
                     conservative_int8
