@@ -4,8 +4,11 @@ use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array2, Array3, Array4};
 use ort::session::{IoBinding, Session};
 use ort::value::{Outlet, Tensor, TensorRef, ValueType};
+use std::ffi::{c_char, c_void, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +34,86 @@ impl EncoderLayout {
     fn projected_cache_layer_values(&self) -> usize {
         self.cache_len * self.hidden_size
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LiteRtEncoderApi {
+    pub version: u32,
+    pub create: Option<
+        unsafe extern "C" fn(
+            model_path: *const c_char,
+            num_threads: i32,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> *mut c_void,
+    >,
+    pub destroy: Option<unsafe extern "C" fn(handle: *mut c_void)>,
+    pub run: Option<
+        unsafe extern "C" fn(
+            handle: *mut c_void,
+            audio_signal: *const f32,
+            audio_signal_len: usize,
+            cache_last_channel: *const f32,
+            cache_last_channel_len: usize,
+            cache_last_time: *const f32,
+            cache_last_time_len: usize,
+            cache_last_channel_len_values: *const i64,
+            cache_last_channel_len_count: usize,
+            outputs: *mut f32,
+            outputs_len: usize,
+            encoded_lengths: *mut i64,
+            encoded_lengths_len: usize,
+            new_cache_last_channel: *mut f32,
+            new_cache_last_channel_len: usize,
+            new_cache_last_time: *mut f32,
+            new_cache_last_time_len: usize,
+            new_cache_last_channel_len_values: *mut i64,
+            new_cache_last_channel_len_count: usize,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool,
+    >,
+}
+
+const LITERT_ENCODER_API_VERSION: u32 = 1;
+static LITERT_ENCODER_API: Mutex<Option<LiteRtEncoderApi>> = Mutex::new(None);
+
+pub fn set_litert_encoder_api(api: *const LiteRtEncoderApi) -> bool {
+    if api.is_null() {
+        return false;
+    }
+    let api = unsafe { *api };
+    if api.version != LITERT_ENCODER_API_VERSION
+        || api.create.is_none()
+        || api.destroy.is_none()
+        || api.run.is_none()
+    {
+        return false;
+    }
+    match LITERT_ENCODER_API.lock() {
+        Ok(mut guard) => {
+            *guard = Some(api);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn get_litert_encoder_api() -> Option<LiteRtEncoderApi> {
+    LITERT_ENCODER_API.lock().ok().and_then(|guard| *guard)
+}
+
+fn read_c_error(buffer: &[c_char]) -> String {
+    let nul_index = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    let bytes = buffer[..nul_index]
+        .iter()
+        .map(|value| *value as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 struct OptimizedModelCachePaths {
@@ -405,9 +488,164 @@ fn roll_projected_cache_layer(
     Ok(())
 }
 
+struct LiteRtEncoderBackend {
+    handle: *mut c_void,
+    api: LiteRtEncoderApi,
+}
+
+impl LiteRtEncoderBackend {
+    fn create(model_path: &Path, num_threads: usize) -> Result<Option<Self>> {
+        if !model_path.exists() {
+            return Ok(None);
+        }
+        let Some(api) = get_litert_encoder_api() else {
+            android_log::info(format!(
+                "crate litert encoder unavailable path={} reason=no_api",
+                model_path.display()
+            ));
+            return Ok(None);
+        };
+        let create = api
+            .create
+            .ok_or_else(|| Error::Config("LiteRT encoder create callback missing".to_string()))?;
+        let path = CString::new(model_path.to_string_lossy().as_bytes())
+            .map_err(|_| Error::Config("LiteRT encoder path contains NUL".to_string()))?;
+        let mut error_buffer = vec![0 as c_char; 1024];
+        let handle = unsafe {
+            create(
+                path.as_ptr(),
+                num_threads as i32,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if handle.is_null() {
+            let message = read_c_error(&error_buffer);
+            return Err(Error::Model(format!(
+                "Failed to create LiteRT encoder {}: {}",
+                model_path.display(),
+                if message.is_empty() {
+                    "unknown error"
+                } else {
+                    &message
+                }
+            )));
+        }
+        android_log::info(format!(
+            "crate litert encoder ready path={} handle={:?}",
+            model_path.display(),
+            handle
+        ));
+        Ok(Some(Self { handle, api }))
+    }
+
+    fn run_encoder_into(
+        &mut self,
+        features: &Array3<f32>,
+        cache: &mut EncoderCache,
+        encoder_out: &mut Array3<f32>,
+    ) -> Result<usize> {
+        let run = self
+            .api
+            .run
+            .ok_or_else(|| Error::Config("LiteRT encoder run callback missing".to_string()))?;
+
+        let (features_ptr, features_len) = features
+            .as_slice()
+            .map(|values| (values.as_ptr(), values.len()))
+            .ok_or_else(|| Error::Model("features is not contiguous".to_string()))?;
+        let (cache_last_channel_ptr, cache_last_channel_len) = cache
+            .cache_last_channel
+            .as_slice()
+            .map(|values| (values.as_ptr(), values.len()))
+            .ok_or_else(|| Error::Model("cache_last_channel is not contiguous".to_string()))?;
+        let (cache_last_time_ptr, cache_last_time_len) = cache
+            .cache_last_time
+            .as_slice()
+            .map(|values| (values.as_ptr(), values.len()))
+            .ok_or_else(|| Error::Model("cache_last_time is not contiguous".to_string()))?;
+        let (cache_len_ptr, cache_len_count) = cache
+            .cache_last_channel_len
+            .as_slice()
+            .map(|values| (values.as_ptr(), values.len()))
+            .ok_or_else(|| Error::Model("cache_last_channel_len is not contiguous".to_string()))?;
+        let encoder_out = encoder_out
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("encoder_out is not contiguous".to_string()))?;
+        let new_cache_last_channel = cache
+            .cache_last_channel
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("cache_last_channel is not contiguous".to_string()))?;
+        let new_cache_last_time = cache
+            .cache_last_time
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("cache_last_time is not contiguous".to_string()))?;
+        let new_cache_last_channel_len = cache
+            .cache_last_channel_len
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("cache_last_channel_len is not contiguous".to_string()))?;
+        let mut encoded_lengths = vec![0i64; new_cache_last_channel_len.len()];
+        let mut error_buffer = vec![0 as c_char; 1024];
+
+        let ok = unsafe {
+            run(
+                self.handle,
+                features_ptr,
+                features_len,
+                cache_last_channel_ptr,
+                cache_last_channel_len,
+                cache_last_time_ptr,
+                cache_last_time_len,
+                cache_len_ptr,
+                cache_len_count,
+                encoder_out.as_mut_ptr(),
+                encoder_out.len(),
+                encoded_lengths.as_mut_ptr(),
+                encoded_lengths.len(),
+                new_cache_last_channel.as_mut_ptr(),
+                new_cache_last_channel.len(),
+                new_cache_last_time.as_mut_ptr(),
+                new_cache_last_time.len(),
+                new_cache_last_channel_len.as_mut_ptr(),
+                new_cache_last_channel_len.len(),
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if !ok {
+            let message = read_c_error(&error_buffer);
+            return Err(Error::Model(format!(
+                "LiteRT encoder run failed: {}",
+                if message.is_empty() {
+                    "unknown error"
+                } else {
+                    &message
+                }
+            )));
+        }
+
+        Ok(encoded_lengths
+            .first()
+            .copied()
+            .unwrap_or(encoder_out.len() as i64) as usize)
+    }
+}
+
+impl Drop for LiteRtEncoderBackend {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            if let Some(destroy) = self.api.destroy {
+                unsafe { destroy(self.handle) };
+            }
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
 pub struct ParakeetEOUModel {
     encoder: Session,
     encoder_binding: IoBinding,
+    litert_encoder: Option<LiteRtEncoderBackend>,
     decoder_joint: Session,
     decoder_binding: IoBinding,
     encoder_cache_abi: EncoderCacheAbi,
@@ -737,6 +975,10 @@ impl ParakeetEOUModel {
             "crate encoder io binding ready elapsedMs={}",
             started_at.elapsed().as_millis()
         ));
+        let litert_encoder = LiteRtEncoderBackend::create(
+            &model_dir.join("encoder.tflite"),
+            exec_config.intra_threads,
+        )?;
 
         // Load decoder
         let builder = Session::builder()?;
@@ -792,6 +1034,7 @@ impl ParakeetEOUModel {
         Ok(Self {
             encoder,
             encoder_binding,
+            litert_encoder,
             decoder_joint,
             decoder_binding,
             encoder_cache_abi,
@@ -837,6 +1080,10 @@ impl ParakeetEOUModel {
         cache: &mut EncoderCache,
         encoder_out: &mut Array3<f32>,
     ) -> Result<usize> {
+        if let Some(litert_encoder) = self.litert_encoder.as_mut() {
+            return litert_encoder.run_encoder_into(features, cache, encoder_out);
+        }
+
         self.encoder_length[0] = length;
         let audio_signal_value = ort::value::TensorRef::<f32>::from_array_view(features.view())?;
         let cache_last_channel_value =

@@ -45,16 +45,24 @@
 
 mod android_log;
 mod audio;
+#[cfg(feature = "cohere")]
+pub mod cohere;
 mod config;
 mod decoder;
 mod decoder_tdt;
 mod error;
 mod execution;
 mod model;
+#[cfg(feature = "cohere")]
+mod model_cohere;
 mod model_eou;
+#[cfg(feature = "multitalker")]
+mod model_multitalker;
 mod model_nemotron;
 mod model_tdt;
 mod model_unified;
+#[cfg(feature = "multitalker")]
+pub mod multitalker;
 mod nemotron;
 mod parakeet;
 mod parakeet_eou;
@@ -62,14 +70,6 @@ mod parakeet_tdt;
 mod parakeet_unified;
 #[cfg(feature = "sortformer")]
 pub mod sortformer;
-#[cfg(feature = "multitalker")]
-mod model_multitalker;
-#[cfg(feature = "multitalker")]
-pub mod multitalker;
-#[cfg(feature = "cohere")]
-mod model_cohere;
-#[cfg(feature = "cohere")]
-pub mod cohere;
 mod timestamps;
 mod transcriber;
 mod vocab;
@@ -85,7 +85,7 @@ pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
 
 pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
 pub use model::ParakeetModel;
-pub use model_eou::ParakeetEOUModel;
+pub use model_eou::{set_litert_encoder_api, LiteRtEncoderApi, ParakeetEOUModel};
 pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
 pub use model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
 pub use nemotron::{Nemotron, SentencePieceVocab};
@@ -93,7 +93,9 @@ pub use parakeet_eou::ParakeetEOU;
 pub use parakeet_unified::{ParakeetUnified, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{
+    LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp,
+};
 
 #[cfg(feature = "cohere")]
 pub use cohere::CohereASR;
