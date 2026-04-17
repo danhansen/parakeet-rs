@@ -667,6 +667,7 @@ impl ParakeetEOUModel {
         let model_dir = model_dir.as_ref();
 
         let encoder_path = {
+            let litert_encoder = model_dir.join("encoder.tflite");
             let projected_kv_layered_fixed =
                 model_dir.join("encoder.projected_kv_cache.layered.fixed.onnx");
             let projected_kv_layered = model_dir.join("encoder.projected_kv_cache.layered.onnx");
@@ -675,7 +676,19 @@ impl ParakeetEOUModel {
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.posconst.onnx");
             let conservative_int8 =
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.onnx");
-            if projected_kv_layered_fixed.exists() {
+            if litert_encoder.exists() {
+                android_log::info(format!(
+                    "crate encoder selection prefer raw-cache ONNX because LiteRT encoder exists path={}",
+                    litert_encoder.display()
+                ));
+                if posconst_int8.exists() {
+                    posconst_int8
+                } else if conservative_int8.exists() {
+                    conservative_int8
+                } else {
+                    model_dir.join("encoder.onnx")
+                }
+            } else if projected_kv_layered_fixed.exists() {
                 projected_kv_layered_fixed
             } else if projected_kv_layered.exists() {
                 projected_kv_layered
