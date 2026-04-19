@@ -931,16 +931,19 @@ impl ParakeetEOUModel {
         let litert_encoder_path = model_dir.join("encoder.tflite");
         let litert_encoder_enabled = model_dir.join("encoder.tflite.enabled");
         let litert_decoder_path = model_dir.join("decoder_joint.tflite");
+        let litert_decoder_enabled = model_dir.join("decoder_joint.tflite.enabled");
         let full_litert = litert_encoder_path.exists()
             && litert_encoder_enabled.exists()
-            && litert_decoder_path.exists();
+            && litert_decoder_path.exists()
+            && litert_decoder_enabled.exists();
 
         if full_litert {
             android_log::info(format!(
-                "crate backend selection full_litert encoder={} marker={} decoder={}",
+                "crate backend selection full_litert encoder={} encoderMarker={} decoder={} decoderMarker={}",
                 litert_encoder_path.display(),
                 litert_encoder_enabled.display(),
-                litert_decoder_path.display()
+                litert_decoder_path.display(),
+                litert_decoder_enabled.display()
             ));
             let litert_encoder =
                 LiteRtEncoderBackend::create(&litert_encoder_path, LITERT_ENCODER_THREADS)?
