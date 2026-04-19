@@ -77,6 +77,7 @@ pub struct LiteRtEncoderApi {
 }
 
 const LITERT_ENCODER_API_VERSION: u32 = 1;
+const LITERT_ENCODER_THREADS: usize = 2;
 static LITERT_ENCODER_API: Mutex<Option<LiteRtEncoderApi>> = Mutex::new(None);
 
 pub fn set_litert_encoder_api(api: *const LiteRtEncoderApi) -> bool {
@@ -1018,7 +1019,11 @@ impl ParakeetEOUModel {
         ));
         let litert_encoder_path = model_dir.join("encoder.tflite");
         let litert_encoder = if encoder_cache_abi == EncoderCacheAbi::RawChannel {
-            LiteRtEncoderBackend::create(&litert_encoder_path, exec_config.intra_threads)?
+            android_log::info(format!(
+                "crate litert encoder create using threads={} ortIntraThreads={}",
+                LITERT_ENCODER_THREADS, exec_config.intra_threads
+            ));
+            LiteRtEncoderBackend::create(&litert_encoder_path, LITERT_ENCODER_THREADS)?
         } else {
             if litert_encoder_path.exists() {
                 android_log::info(format!(
