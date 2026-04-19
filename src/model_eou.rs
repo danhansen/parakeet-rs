@@ -32,7 +32,11 @@ pub struct EncoderLayout {
 
 impl EncoderLayout {
     fn projected_cache_layer_values(&self) -> usize {
-        self.cache_len * self.hidden_size
+        self.batch * self.cache_len * self.hidden_size
+    }
+
+    fn projected_current_layer_values(&self) -> usize {
+        self.batch * self.output_frames * self.hidden_size
     }
 }
 
@@ -47,6 +51,7 @@ pub struct LiteRtEncoderLayout {
     pub cache_len: i64,
     pub hidden_size: i64,
     pub time_cache_len: i64,
+    pub cache_abi: i64,
 }
 
 impl TryFrom<LiteRtEncoderLayout> for EncoderLayout {
@@ -80,6 +85,16 @@ impl TryFrom<LiteRtEncoderLayout> for EncoderLayout {
             hidden_size: value.hidden_size as usize,
             time_cache_len: value.time_cache_len as usize,
         })
+    }
+}
+
+fn litert_cache_abi_from_i64(value: i64) -> Result<EncoderCacheAbi> {
+    match value {
+        0 => Ok(EncoderCacheAbi::RawChannel),
+        2 => Ok(EncoderCacheAbi::ProjectedKvLayered),
+        other => Err(Error::Model(format!(
+            "LiteRT encoder reported unsupported cache ABI {other}"
+        ))),
     }
 }
 
@@ -117,6 +132,39 @@ pub struct LiteRtEncoderApi {
             new_cache_last_time_len: usize,
             new_cache_last_channel_len_values: *mut i64,
             new_cache_last_channel_len_count: usize,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool,
+    >,
+    pub run_projected_layered: Option<
+        unsafe extern "C" fn(
+            handle: *mut c_void,
+            audio_signal: *const f32,
+            audio_signal_len: usize,
+            cache_last_channel: *const f32,
+            cache_last_channel_len: usize,
+            cache_last_time: *const f32,
+            cache_last_time_len: usize,
+            cache_last_channel_len_values: *const i64,
+            cache_last_channel_len_count: usize,
+            cache_last_key: *const f32,
+            cache_last_key_len: usize,
+            cache_last_value: *const f32,
+            cache_last_value_len: usize,
+            outputs: *mut f32,
+            outputs_len: usize,
+            encoded_lengths: *mut i64,
+            encoded_lengths_len: usize,
+            new_cache_last_channel: *mut f32,
+            new_cache_last_channel_len: usize,
+            new_cache_last_time: *mut f32,
+            new_cache_last_time_len: usize,
+            new_cache_last_channel_len_values: *mut i64,
+            new_cache_last_channel_len_count: usize,
+            projected_current_key: *mut f32,
+            projected_current_key_len: usize,
+            projected_current_value: *mut f32,
+            projected_current_value_len: usize,
             error_buffer: *mut c_char,
             error_buffer_len: usize,
         ) -> bool,
@@ -161,7 +209,7 @@ pub struct LiteRtEncoderApi {
     >,
 }
 
-const LITERT_ENCODER_API_VERSION: u32 = 2;
+const LITERT_ENCODER_API_VERSION: u32 = 3;
 const LITERT_ENCODER_THREADS: usize = 2;
 static LITERT_ENCODER_API: Mutex<Option<LiteRtEncoderApi>> = Mutex::new(None);
 
@@ -174,6 +222,7 @@ pub fn set_litert_encoder_api(api: *const LiteRtEncoderApi) -> bool {
         || api.create.is_none()
         || api.destroy.is_none()
         || api.run.is_none()
+        || api.run_projected_layered.is_none()
         || api.get_encoder_layout.is_none()
         || api.create_decoder.is_none()
         || api.destroy_decoder.is_none()
@@ -532,6 +581,24 @@ fn projected_cache_layer_slice(
         .ok_or_else(|| Error::Model(format!("projected cache layer {layer} is out of bounds")))
 }
 
+fn projected_current_layer_slice(
+    cache: &Array4<f32>,
+    layer: usize,
+    layout: EncoderLayout,
+) -> Result<&[f32]> {
+    let all = cache
+        .as_slice()
+        .ok_or_else(|| Error::Model("projected current cache is not contiguous".to_string()))?;
+    let layer_values = layout.projected_current_layer_values();
+    let start = layer * layer_values;
+    let end = start + layer_values;
+    all.get(start..end).ok_or_else(|| {
+        Error::Model(format!(
+            "projected current cache layer {layer} is out of bounds"
+        ))
+    })
+}
+
 fn roll_projected_cache_layer(
     cache: &mut Array4<f32>,
     layer: usize,
@@ -581,6 +648,8 @@ fn roll_projected_cache_layer(
 struct LiteRtEncoderBackend {
     handle: *mut c_void,
     api: LiteRtEncoderApi,
+    layout: EncoderLayout,
+    cache_abi: EncoderCacheAbi,
 }
 
 impl LiteRtEncoderBackend {
@@ -621,17 +690,50 @@ impl LiteRtEncoderBackend {
                 }
             )));
         }
+        let raw_layout = match Self::read_layout(api, handle) {
+            Ok(layout) => layout,
+            Err(err) => {
+                if let Some(destroy) = api.destroy {
+                    unsafe { destroy(handle) };
+                }
+                return Err(err);
+            }
+        };
+        let cache_abi = match litert_cache_abi_from_i64(raw_layout.cache_abi) {
+            Ok(cache_abi) => cache_abi,
+            Err(err) => {
+                if let Some(destroy) = api.destroy {
+                    unsafe { destroy(handle) };
+                }
+                return Err(err);
+            }
+        };
+        let layout = match EncoderLayout::try_from(raw_layout) {
+            Ok(layout) => layout,
+            Err(err) => {
+                if let Some(destroy) = api.destroy {
+                    unsafe { destroy(handle) };
+                }
+                return Err(err);
+            }
+        };
         android_log::info(format!(
-            "crate litert encoder ready path={} handle={:?}",
+            "crate litert encoder ready path={} handle={:?} abi={:?} layout={:?}",
             model_path.display(),
-            handle
+            handle,
+            cache_abi,
+            layout
         ));
-        Ok(Some(Self { handle, api }))
+        Ok(Some(Self {
+            handle,
+            api,
+            layout,
+            cache_abi,
+        }))
     }
 
-    fn encoder_layout(&self) -> Result<EncoderLayout> {
-        let get_encoder_layout = self
-            .api
+    fn read_layout(api: LiteRtEncoderApi, handle: *mut c_void) -> Result<LiteRtEncoderLayout> {
+        let get_encoder_layout = api
             .get_encoder_layout
             .ok_or_else(|| Error::Config("LiteRT encoder layout callback missing".to_string()))?;
         let mut layout = LiteRtEncoderLayout {
@@ -643,11 +745,12 @@ impl LiteRtEncoderBackend {
             cache_len: 0,
             hidden_size: 0,
             time_cache_len: 0,
+            cache_abi: -1,
         };
         let mut error_buffer = vec![0 as c_char; 1024];
         let ok = unsafe {
             get_encoder_layout(
-                self.handle,
+                handle,
                 &mut layout,
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
@@ -664,7 +767,15 @@ impl LiteRtEncoderBackend {
                 }
             )));
         }
-        EncoderLayout::try_from(layout)
+        Ok(layout)
+    }
+
+    fn encoder_layout(&self) -> EncoderLayout {
+        self.layout
+    }
+
+    fn encoder_cache_abi(&self) -> EncoderCacheAbi {
+        self.cache_abi
     }
 
     fn run_encoder_into(
@@ -672,12 +783,9 @@ impl LiteRtEncoderBackend {
         features: &Array3<f32>,
         cache: &mut EncoderCache,
         encoder_out: &mut Array3<f32>,
+        projected_current_key: &mut Array4<f32>,
+        projected_current_value: &mut Array4<f32>,
     ) -> Result<usize> {
-        let run = self
-            .api
-            .run
-            .ok_or_else(|| Error::Config("LiteRT encoder run callback missing".to_string()))?;
-
         let (features_ptr, features_len) = features
             .as_slice()
             .map(|values| (values.as_ptr(), values.len()))
@@ -715,30 +823,104 @@ impl LiteRtEncoderBackend {
         let mut encoded_lengths = vec![0i64; new_cache_last_channel_len.len()];
         let mut error_buffer = vec![0 as c_char; 1024];
 
-        let ok = unsafe {
-            run(
-                self.handle,
-                features_ptr,
-                features_len,
-                cache_last_channel_ptr,
-                cache_last_channel_len,
-                cache_last_time_ptr,
-                cache_last_time_len,
-                cache_len_ptr,
-                cache_len_count,
-                encoder_out.as_mut_ptr(),
-                encoder_out.len(),
-                encoded_lengths.as_mut_ptr(),
-                encoded_lengths.len(),
-                new_cache_last_channel.as_mut_ptr(),
-                new_cache_last_channel.len(),
-                new_cache_last_time.as_mut_ptr(),
-                new_cache_last_time.len(),
-                new_cache_last_channel_len.as_mut_ptr(),
-                new_cache_last_channel_len.len(),
-                error_buffer.as_mut_ptr(),
-                error_buffer.len(),
-            )
+        let ok = match self.cache_abi {
+            EncoderCacheAbi::RawChannel => {
+                let run = self.api.run.ok_or_else(|| {
+                    Error::Config("LiteRT encoder run callback missing".to_string())
+                })?;
+                unsafe {
+                    run(
+                        self.handle,
+                        features_ptr,
+                        features_len,
+                        cache_last_channel_ptr,
+                        cache_last_channel_len,
+                        cache_last_time_ptr,
+                        cache_last_time_len,
+                        cache_len_ptr,
+                        cache_len_count,
+                        encoder_out.as_mut_ptr(),
+                        encoder_out.len(),
+                        encoded_lengths.as_mut_ptr(),
+                        encoded_lengths.len(),
+                        new_cache_last_channel.as_mut_ptr(),
+                        new_cache_last_channel.len(),
+                        new_cache_last_time.as_mut_ptr(),
+                        new_cache_last_time.len(),
+                        new_cache_last_channel_len.as_mut_ptr(),
+                        new_cache_last_channel_len.len(),
+                        error_buffer.as_mut_ptr(),
+                        error_buffer.len(),
+                    )
+                }
+            }
+            EncoderCacheAbi::ProjectedKvLayered => {
+                let run_projected = self.api.run_projected_layered.ok_or_else(|| {
+                    Error::Config("LiteRT projected encoder run callback missing".to_string())
+                })?;
+                let (cache_last_key_ptr, cache_last_key_len) = cache
+                    .cache_last_key
+                    .as_slice()
+                    .map(|values| (values.as_ptr(), values.len()))
+                    .ok_or_else(|| Error::Model("cache_last_key is not contiguous".to_string()))?;
+                let (cache_last_value_ptr, cache_last_value_len) = cache
+                    .cache_last_value
+                    .as_slice()
+                    .map(|values| (values.as_ptr(), values.len()))
+                    .ok_or_else(|| {
+                        Error::Model("cache_last_value is not contiguous".to_string())
+                    })?;
+                let (projected_key_ptr, projected_key_len) = projected_current_key
+                    .as_slice_mut()
+                    .map(|values| (values.as_mut_ptr(), values.len()))
+                    .ok_or_else(|| {
+                        Error::Model("projected_current_key is not contiguous".to_string())
+                    })?;
+                let (projected_value_ptr, projected_value_len) = projected_current_value
+                    .as_slice_mut()
+                    .map(|values| (values.as_mut_ptr(), values.len()))
+                    .ok_or_else(|| {
+                        Error::Model("projected_current_value is not contiguous".to_string())
+                    })?;
+                unsafe {
+                    run_projected(
+                        self.handle,
+                        features_ptr,
+                        features_len,
+                        cache_last_channel_ptr,
+                        cache_last_channel_len,
+                        cache_last_time_ptr,
+                        cache_last_time_len,
+                        cache_len_ptr,
+                        cache_len_count,
+                        cache_last_key_ptr,
+                        cache_last_key_len,
+                        cache_last_value_ptr,
+                        cache_last_value_len,
+                        encoder_out.as_mut_ptr(),
+                        encoder_out.len(),
+                        encoded_lengths.as_mut_ptr(),
+                        encoded_lengths.len(),
+                        new_cache_last_channel.as_mut_ptr(),
+                        new_cache_last_channel.len(),
+                        new_cache_last_time.as_mut_ptr(),
+                        new_cache_last_time.len(),
+                        new_cache_last_channel_len.as_mut_ptr(),
+                        new_cache_last_channel_len.len(),
+                        projected_key_ptr,
+                        projected_key_len,
+                        projected_value_ptr,
+                        projected_value_len,
+                        error_buffer.as_mut_ptr(),
+                        error_buffer.len(),
+                    )
+                }
+            }
+            EncoderCacheAbi::ProjectedKvStacked => {
+                return Err(Error::Config(
+                    "LiteRT stacked projected-cache ABI is not supported".to_string(),
+                ));
+            }
         };
         if !ok {
             let message = read_c_error(&error_buffer);
@@ -750,6 +932,33 @@ impl LiteRtEncoderBackend {
                     &message
                 }
             )));
+        }
+
+        if self.cache_abi == EncoderCacheAbi::ProjectedKvLayered {
+            let shape = [
+                self.layout.batch as i64,
+                self.layout.output_frames as i64,
+                self.layout.hidden_size as i64,
+            ];
+            for layer in 0..self.layout.num_layers {
+                let key = projected_current_layer_slice(projected_current_key, layer, self.layout)?;
+                roll_projected_cache_layer(
+                    &mut cache.cache_last_key,
+                    layer,
+                    self.layout,
+                    &shape,
+                    key,
+                )?;
+                let value =
+                    projected_current_layer_slice(projected_current_value, layer, self.layout)?;
+                roll_projected_cache_layer(
+                    &mut cache.cache_last_value,
+                    layer,
+                    self.layout,
+                    &shape,
+                    value,
+                )?;
+            }
         }
 
         Ok(encoded_lengths
@@ -917,6 +1126,8 @@ pub struct ParakeetEOUModel {
     encoder_has_raw_channel_cache: bool,
     encoder_outputs_raw_channel_cache: bool,
     encoder_length: Array1<i64>,
+    litert_projected_current_key: Array4<f32>,
+    litert_projected_current_value: Array4<f32>,
     decoder_target_length: Array1<i32>,
 }
 
@@ -950,8 +1161,12 @@ impl ParakeetEOUModel {
                                 .to_string(),
                         )
                     })?;
-            let encoder_layout = litert_encoder.encoder_layout()?;
-            android_log::info(format!("crate litert encoder layout={:?}", encoder_layout));
+            let encoder_layout = litert_encoder.encoder_layout();
+            let encoder_cache_abi = litert_encoder.encoder_cache_abi();
+            android_log::info(format!(
+                "crate litert encoder layout={:?} abi={:?}",
+                encoder_layout, encoder_cache_abi
+            ));
             let litert_decoder =
                 LiteRtDecoderBackend::create(&litert_decoder_path, LITERT_ENCODER_THREADS)?
                     .ok_or_else(|| {
@@ -971,12 +1186,24 @@ impl ParakeetEOUModel {
                 decoder_joint: None,
                 decoder_binding: None,
                 litert_decoder: Some(litert_decoder),
-                encoder_cache_abi: EncoderCacheAbi::RawChannel,
+                encoder_cache_abi,
                 encoder_layout,
                 encoder_accepts_length: false,
                 encoder_has_raw_channel_cache: true,
                 encoder_outputs_raw_channel_cache: true,
                 encoder_length: Array1::zeros(encoder_layout.batch),
+                litert_projected_current_key: Array4::zeros((
+                    encoder_layout.num_layers,
+                    encoder_layout.batch,
+                    encoder_layout.output_frames,
+                    encoder_layout.hidden_size,
+                )),
+                litert_projected_current_value: Array4::zeros((
+                    encoder_layout.num_layers,
+                    encoder_layout.batch,
+                    encoder_layout.output_frames,
+                    encoder_layout.hidden_size,
+                )),
                 decoder_target_length: Array1::from_vec(vec![1i32]),
             });
         }
@@ -1410,6 +1637,18 @@ impl ParakeetEOUModel {
             encoder_has_raw_channel_cache,
             encoder_outputs_raw_channel_cache,
             encoder_length: Array1::zeros(encoder_layout.batch),
+            litert_projected_current_key: Array4::zeros((
+                encoder_layout.num_layers,
+                encoder_layout.batch,
+                encoder_layout.output_frames,
+                encoder_layout.hidden_size,
+            )),
+            litert_projected_current_value: Array4::zeros((
+                encoder_layout.num_layers,
+                encoder_layout.batch,
+                encoder_layout.output_frames,
+                encoder_layout.hidden_size,
+            )),
             decoder_target_length: Array1::from_vec(vec![1i32]),
         })
     }
@@ -1452,7 +1691,13 @@ impl ParakeetEOUModel {
         encoder_out: &mut Array3<f32>,
     ) -> Result<usize> {
         if let Some(litert_encoder) = self.litert_encoder.as_mut() {
-            return litert_encoder.run_encoder_into(features, cache, encoder_out);
+            return litert_encoder.run_encoder_into(
+                features,
+                cache,
+                encoder_out,
+                &mut self.litert_projected_current_key,
+                &mut self.litert_projected_current_value,
+            );
         }
 
         let encoder = self
