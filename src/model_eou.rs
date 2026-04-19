@@ -38,6 +38,53 @@ impl EncoderLayout {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct LiteRtEncoderLayout {
+    pub batch: i64,
+    pub n_mels: i64,
+    pub input_frames: i64,
+    pub output_frames: i64,
+    pub num_layers: i64,
+    pub cache_len: i64,
+    pub hidden_size: i64,
+    pub time_cache_len: i64,
+}
+
+impl TryFrom<LiteRtEncoderLayout> for EncoderLayout {
+    type Error = Error;
+
+    fn try_from(value: LiteRtEncoderLayout) -> Result<Self> {
+        let dims = [
+            ("batch", value.batch),
+            ("n_mels", value.n_mels),
+            ("input_frames", value.input_frames),
+            ("output_frames", value.output_frames),
+            ("num_layers", value.num_layers),
+            ("cache_len", value.cache_len),
+            ("hidden_size", value.hidden_size),
+            ("time_cache_len", value.time_cache_len),
+        ];
+        for (name, dim) in dims {
+            if dim <= 0 {
+                return Err(Error::Model(format!(
+                    "LiteRT encoder layout has invalid {name}={dim}"
+                )));
+            }
+        }
+        Ok(Self {
+            batch: value.batch as usize,
+            n_mels: value.n_mels as usize,
+            input_frames: value.input_frames as usize,
+            output_frames: value.output_frames as usize,
+            num_layers: value.num_layers as usize,
+            cache_len: value.cache_len as usize,
+            hidden_size: value.hidden_size as usize,
+            time_cache_len: value.time_cache_len as usize,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct LiteRtEncoderApi {
     pub version: u32,
     pub create: Option<
@@ -74,9 +121,47 @@ pub struct LiteRtEncoderApi {
             error_buffer_len: usize,
         ) -> bool,
     >,
+    pub get_encoder_layout: Option<
+        unsafe extern "C" fn(
+            handle: *mut c_void,
+            layout: *mut LiteRtEncoderLayout,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool,
+    >,
+    pub create_decoder: Option<
+        unsafe extern "C" fn(
+            model_path: *const c_char,
+            num_threads: i32,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> *mut c_void,
+    >,
+    pub destroy_decoder: Option<unsafe extern "C" fn(handle: *mut c_void)>,
+    pub run_decoder: Option<
+        unsafe extern "C" fn(
+            handle: *mut c_void,
+            encoder_frame: *const f32,
+            encoder_frame_len: usize,
+            targets: *const i32,
+            targets_len: usize,
+            state_h: *const f32,
+            state_h_len: usize,
+            state_c: *const f32,
+            state_c_len: usize,
+            logits: *mut f32,
+            logits_len: usize,
+            new_h: *mut f32,
+            new_h_len: usize,
+            new_c: *mut f32,
+            new_c_len: usize,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool,
+    >,
 }
 
-const LITERT_ENCODER_API_VERSION: u32 = 1;
+const LITERT_ENCODER_API_VERSION: u32 = 2;
 const LITERT_ENCODER_THREADS: usize = 2;
 static LITERT_ENCODER_API: Mutex<Option<LiteRtEncoderApi>> = Mutex::new(None);
 
@@ -89,6 +174,10 @@ pub fn set_litert_encoder_api(api: *const LiteRtEncoderApi) -> bool {
         || api.create.is_none()
         || api.destroy.is_none()
         || api.run.is_none()
+        || api.get_encoder_layout.is_none()
+        || api.create_decoder.is_none()
+        || api.destroy_decoder.is_none()
+        || api.run_decoder.is_none()
     {
         return false;
     }
@@ -540,6 +629,44 @@ impl LiteRtEncoderBackend {
         Ok(Some(Self { handle, api }))
     }
 
+    fn encoder_layout(&self) -> Result<EncoderLayout> {
+        let get_encoder_layout = self
+            .api
+            .get_encoder_layout
+            .ok_or_else(|| Error::Config("LiteRT encoder layout callback missing".to_string()))?;
+        let mut layout = LiteRtEncoderLayout {
+            batch: 0,
+            n_mels: 0,
+            input_frames: 0,
+            output_frames: 0,
+            num_layers: 0,
+            cache_len: 0,
+            hidden_size: 0,
+            time_cache_len: 0,
+        };
+        let mut error_buffer = vec![0 as c_char; 1024];
+        let ok = unsafe {
+            get_encoder_layout(
+                self.handle,
+                &mut layout,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if !ok {
+            let message = read_c_error(&error_buffer);
+            return Err(Error::Model(format!(
+                "LiteRT encoder layout failed: {}",
+                if message.is_empty() {
+                    "unknown error"
+                } else {
+                    &message
+                }
+            )));
+        }
+        EncoderLayout::try_from(layout)
+    }
+
     fn run_encoder_into(
         &mut self,
         features: &Array3<f32>,
@@ -643,12 +770,147 @@ impl Drop for LiteRtEncoderBackend {
     }
 }
 
+struct LiteRtDecoderBackend {
+    handle: *mut c_void,
+    api: LiteRtEncoderApi,
+}
+
+impl LiteRtDecoderBackend {
+    fn create(model_path: &Path, num_threads: usize) -> Result<Option<Self>> {
+        if !model_path.exists() {
+            return Ok(None);
+        }
+        let Some(api) = get_litert_encoder_api() else {
+            android_log::info(format!(
+                "crate litert decoder unavailable path={} reason=no_api",
+                model_path.display()
+            ));
+            return Ok(None);
+        };
+        let create = api
+            .create_decoder
+            .ok_or_else(|| Error::Config("LiteRT decoder create callback missing".to_string()))?;
+        let path = CString::new(model_path.to_string_lossy().as_bytes())
+            .map_err(|_| Error::Config("LiteRT decoder path contains NUL".to_string()))?;
+        let mut error_buffer = vec![0 as c_char; 1024];
+        let handle = unsafe {
+            create(
+                path.as_ptr(),
+                num_threads as i32,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if handle.is_null() {
+            let message = read_c_error(&error_buffer);
+            return Err(Error::Model(format!(
+                "Failed to create LiteRT decoder {}: {}",
+                model_path.display(),
+                if message.is_empty() {
+                    "unknown error"
+                } else {
+                    &message
+                }
+            )));
+        }
+        android_log::info(format!(
+            "crate litert decoder ready path={} handle={:?}",
+            model_path.display(),
+            handle
+        ));
+        Ok(Some(Self { handle, api }))
+    }
+
+    fn run_decoder_into(
+        &mut self,
+        encoder_frame: &Array3<f32>,
+        last_token: &Array2<i32>,
+        state_h: &Array3<f32>,
+        state_c: &Array3<f32>,
+        logits: &mut Array3<f32>,
+        new_h: &mut Array3<f32>,
+        new_c: &mut Array3<f32>,
+    ) -> Result<()> {
+        let run = self
+            .api
+            .run_decoder
+            .ok_or_else(|| Error::Config("LiteRT decoder run callback missing".to_string()))?;
+        let encoder_frame = encoder_frame
+            .as_slice()
+            .ok_or_else(|| Error::Model("decoder encoder_frame is not contiguous".to_string()))?;
+        let last_token = last_token
+            .as_slice()
+            .ok_or_else(|| Error::Model("decoder last_token is not contiguous".to_string()))?;
+        let state_h = state_h
+            .as_slice()
+            .ok_or_else(|| Error::Model("decoder state_h is not contiguous".to_string()))?;
+        let state_c = state_c
+            .as_slice()
+            .ok_or_else(|| Error::Model("decoder state_c is not contiguous".to_string()))?;
+        let logits = logits
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("decoder logits is not contiguous".to_string()))?;
+        let new_h = new_h
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("decoder new_h is not contiguous".to_string()))?;
+        let new_c = new_c
+            .as_slice_mut()
+            .ok_or_else(|| Error::Model("decoder new_c is not contiguous".to_string()))?;
+        let mut error_buffer = vec![0 as c_char; 1024];
+        let ok = unsafe {
+            run(
+                self.handle,
+                encoder_frame.as_ptr(),
+                encoder_frame.len(),
+                last_token.as_ptr(),
+                last_token.len(),
+                state_h.as_ptr(),
+                state_h.len(),
+                state_c.as_ptr(),
+                state_c.len(),
+                logits.as_mut_ptr(),
+                logits.len(),
+                new_h.as_mut_ptr(),
+                new_h.len(),
+                new_c.as_mut_ptr(),
+                new_c.len(),
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        if !ok {
+            let message = read_c_error(&error_buffer);
+            return Err(Error::Model(format!(
+                "LiteRT decoder run failed: {}",
+                if message.is_empty() {
+                    "unknown error"
+                } else {
+                    &message
+                }
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LiteRtDecoderBackend {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            if let Some(destroy) = self.api.destroy_decoder {
+                unsafe { destroy(self.handle) };
+            }
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
 pub struct ParakeetEOUModel {
-    encoder: Session,
-    encoder_binding: IoBinding,
+    encoder: Option<Session>,
+    encoder_binding: Option<IoBinding>,
     litert_encoder: Option<LiteRtEncoderBackend>,
-    decoder_joint: Session,
-    decoder_binding: IoBinding,
+    decoder_joint: Option<Session>,
+    decoder_binding: Option<IoBinding>,
+    litert_decoder: Option<LiteRtDecoderBackend>,
     encoder_cache_abi: EncoderCacheAbi,
     encoder_layout: EncoderLayout,
     encoder_accepts_length: bool,
@@ -666,10 +928,60 @@ impl ParakeetEOUModel {
     ) -> Result<Self> {
         let started_at = Instant::now();
         let model_dir = model_dir.as_ref();
+        let litert_encoder_path = model_dir.join("encoder.tflite");
+        let litert_encoder_enabled = model_dir.join("encoder.tflite.enabled");
+        let litert_decoder_path = model_dir.join("decoder_joint.tflite");
+        let full_litert = litert_encoder_path.exists()
+            && litert_encoder_enabled.exists()
+            && litert_decoder_path.exists();
+
+        if full_litert {
+            android_log::info(format!(
+                "crate backend selection full_litert encoder={} marker={} decoder={}",
+                litert_encoder_path.display(),
+                litert_encoder_enabled.display(),
+                litert_decoder_path.display()
+            ));
+            let litert_encoder =
+                LiteRtEncoderBackend::create(&litert_encoder_path, LITERT_ENCODER_THREADS)?
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "Full LiteRT model selected, but LiteRT encoder API is unavailable"
+                                .to_string(),
+                        )
+                    })?;
+            let encoder_layout = litert_encoder.encoder_layout()?;
+            android_log::info(format!("crate litert encoder layout={:?}", encoder_layout));
+            let litert_decoder =
+                LiteRtDecoderBackend::create(&litert_decoder_path, LITERT_ENCODER_THREADS)?
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "Full LiteRT model selected, but LiteRT decoder API is unavailable"
+                                .to_string(),
+                        )
+                    })?;
+            android_log::info(format!(
+                "crate full_litert ready elapsedMs={}",
+                started_at.elapsed().as_millis()
+            ));
+            return Ok(Self {
+                encoder: None,
+                encoder_binding: None,
+                litert_encoder: Some(litert_encoder),
+                decoder_joint: None,
+                decoder_binding: None,
+                litert_decoder: Some(litert_decoder),
+                encoder_cache_abi: EncoderCacheAbi::RawChannel,
+                encoder_layout,
+                encoder_accepts_length: false,
+                encoder_has_raw_channel_cache: true,
+                encoder_outputs_raw_channel_cache: true,
+                encoder_length: Array1::zeros(encoder_layout.batch),
+                decoder_target_length: Array1::from_vec(vec![1i32]),
+            });
+        }
 
         let encoder_path = {
-            let litert_encoder = model_dir.join("encoder.tflite");
-            let litert_encoder_enabled = model_dir.join("encoder.tflite.enabled");
             let projected_kv_layered_fixed =
                 model_dir.join("encoder.projected_kv_cache.layered.fixed.onnx");
             let projected_kv_layered = model_dir.join("encoder.projected_kv_cache.layered.onnx");
@@ -681,10 +993,10 @@ impl ParakeetEOUModel {
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.posconst.onnx");
             let conservative_int8 =
                 model_dir.join("encoder.matmul_gemm.dynamic_int8.fullpre_cacheabi.onnx");
-            if litert_encoder.exists() && litert_encoder_enabled.exists() {
+            if litert_encoder_path.exists() && litert_encoder_enabled.exists() {
                 android_log::info(format!(
                     "crate encoder selection prefer raw-cache ONNX because LiteRT encoder is explicitly enabled path={} marker={}",
-                    litert_encoder.display(),
+                    litert_encoder_path.display(),
                     litert_encoder_enabled.display()
                 ));
                 if fixed_raw_cache_int8.exists() {
@@ -698,10 +1010,10 @@ impl ParakeetEOUModel {
                 } else {
                     model_dir.join("encoder.onnx")
                 }
-            } else if litert_encoder.exists() {
+            } else if litert_encoder_path.exists() {
                 android_log::info(format!(
                     "crate encoder selection ignoring LiteRT encoder without opt-in marker path={} marker={}",
-                    litert_encoder.display(),
+                    litert_encoder_path.display(),
                     litert_encoder_enabled.display()
                 ));
                 if projected_kv_layered_fixed.exists() {
@@ -1017,7 +1329,6 @@ impl ParakeetEOUModel {
             "crate encoder io binding ready elapsedMs={}",
             started_at.elapsed().as_millis()
         ));
-        let litert_encoder_path = model_dir.join("encoder.tflite");
         let litert_encoder = if encoder_cache_abi == EncoderCacheAbi::RawChannel {
             android_log::info(format!(
                 "crate litert encoder create using threads={} ortIntraThreads={}",
@@ -1087,11 +1398,12 @@ impl ParakeetEOUModel {
         ));
 
         Ok(Self {
-            encoder,
-            encoder_binding,
+            encoder: Some(encoder),
+            encoder_binding: Some(encoder_binding),
             litert_encoder,
-            decoder_joint,
-            decoder_binding,
+            decoder_joint: Some(decoder_joint),
+            decoder_binding: Some(decoder_binding),
+            litert_decoder: None,
             encoder_cache_abi,
             encoder_layout,
             encoder_accepts_length,
@@ -1108,18 +1420,22 @@ impl ParakeetEOUModel {
 
     pub fn end_profiling(&mut self) -> Result<Vec<String>> {
         let mut paths = Vec::new();
-        match self.encoder.end_profiling() {
-            Ok(path) if !path.is_empty() => paths.push(path),
-            Ok(_) => {}
-            Err(err) => {
-                android_log::error(format!("crate encoder endProfiling failed error={err}"));
+        if let Some(encoder) = self.encoder.as_mut() {
+            match encoder.end_profiling() {
+                Ok(path) if !path.is_empty() => paths.push(path),
+                Ok(_) => {}
+                Err(err) => {
+                    android_log::error(format!("crate encoder endProfiling failed error={err}"));
+                }
             }
         }
-        match self.decoder_joint.end_profiling() {
-            Ok(path) if !path.is_empty() => paths.push(path),
-            Ok(_) => {}
-            Err(err) => {
-                android_log::error(format!("crate decoder endProfiling failed error={err}"));
+        if let Some(decoder_joint) = self.decoder_joint.as_mut() {
+            match decoder_joint.end_profiling() {
+                Ok(path) if !path.is_empty() => paths.push(path),
+                Ok(_) => {}
+                Err(err) => {
+                    android_log::error(format!("crate decoder endProfiling failed error={err}"));
+                }
             }
         }
         Ok(paths)
@@ -1139,6 +1455,15 @@ impl ParakeetEOUModel {
             return litert_encoder.run_encoder_into(features, cache, encoder_out);
         }
 
+        let encoder = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| Error::Config("ONNX encoder session is not available".to_string()))?;
+        let encoder_binding = self
+            .encoder_binding
+            .as_mut()
+            .ok_or_else(|| Error::Config("ONNX encoder binding is not available".to_string()))?;
+
         self.encoder_length[0] = length;
         let audio_signal_value = ort::value::TensorRef::<f32>::from_array_view(features.view())?;
         let cache_last_channel_value =
@@ -1151,8 +1476,7 @@ impl ParakeetEOUModel {
         let outputs = {
             let mut projected_cache_input_values = Vec::new();
 
-            self.encoder_binding
-                .bind_input("audio_signal", &audio_signal_value)?;
+            encoder_binding.bind_input("audio_signal", &audio_signal_value)?;
             let length_value = if self.encoder_accepts_length {
                 Some(ort::value::TensorRef::<i64>::from_array_view(
                     self.encoder_length.view(),
@@ -1161,21 +1485,19 @@ impl ParakeetEOUModel {
                 None
             };
             if let Some(length_value) = length_value.as_ref() {
-                self.encoder_binding.bind_input("length", length_value)?;
+                encoder_binding.bind_input("length", length_value)?;
             }
             if self.encoder_has_raw_channel_cache {
-                self.encoder_binding
-                    .bind_input("cache_last_channel", &cache_last_channel_value)?;
+                encoder_binding.bind_input("cache_last_channel", &cache_last_channel_value)?;
             }
             match self.encoder_cache_abi {
                 EncoderCacheAbi::ProjectedKvStacked => {
                     let key = TensorRef::<f32>::from_array_view(cache.cache_last_key.view())?;
-                    self.encoder_binding.bind_input("cache_last_key", &key)?;
+                    encoder_binding.bind_input("cache_last_key", &key)?;
                     projected_cache_input_values.push(key);
 
                     let value = TensorRef::<f32>::from_array_view(cache.cache_last_value.view())?;
-                    self.encoder_binding
-                        .bind_input("cache_last_value", &value)?;
+                    encoder_binding.bind_input("cache_last_value", &value)?;
                     projected_cache_input_values.push(value);
                 }
                 EncoderCacheAbi::ProjectedKvLayered => {
@@ -1193,8 +1515,7 @@ impl ParakeetEOUModel {
                                 self.encoder_layout,
                             )?,
                         ))?;
-                        self.encoder_binding
-                            .bind_input(cache_layer_input_name("key", layer), &key)?;
+                        encoder_binding.bind_input(cache_layer_input_name("key", layer), &key)?;
                         projected_cache_input_values.push(key);
 
                         let value = TensorRef::<f32>::from_array_view((
@@ -1209,19 +1530,17 @@ impl ParakeetEOUModel {
                                 self.encoder_layout,
                             )?,
                         ))?;
-                        self.encoder_binding
+                        encoder_binding
                             .bind_input(cache_layer_input_name("value", layer), &value)?;
                         projected_cache_input_values.push(value);
                     }
                 }
                 EncoderCacheAbi::RawChannel => {}
             }
-            self.encoder_binding
-                .bind_input("cache_last_time", &cache_last_time_value)?;
-            self.encoder_binding
-                .bind_input("cache_last_channel_len", &cache_last_channel_len_value)?;
+            encoder_binding.bind_input("cache_last_time", &cache_last_time_value)?;
+            encoder_binding.bind_input("cache_last_channel_len", &cache_last_channel_len_value)?;
 
-            self.encoder.run_binding(&self.encoder_binding)?
+            encoder.run_binding(encoder_binding)?
         };
 
         // Extract encoder output [1, 512, T]
@@ -1403,6 +1722,27 @@ impl ParakeetEOUModel {
         new_h: &mut Array3<f32>,
         new_c: &mut Array3<f32>,
     ) -> Result<()> {
+        if let Some(litert_decoder) = self.litert_decoder.as_mut() {
+            return litert_decoder.run_decoder_into(
+                encoder_frame,
+                last_token,
+                state_h,
+                state_c,
+                logits,
+                new_h,
+                new_c,
+            );
+        }
+
+        let decoder_joint = self
+            .decoder_joint
+            .as_mut()
+            .ok_or_else(|| Error::Config("ONNX decoder session is not available".to_string()))?;
+        let decoder_binding = self
+            .decoder_binding
+            .as_mut()
+            .ok_or_else(|| Error::Config("ONNX decoder binding is not available".to_string()))?;
+
         let encoder_outputs_value =
             ort::value::TensorRef::<f32>::from_array_view(encoder_frame.view())?;
         let targets_value = ort::value::TensorRef::<i32>::from_array_view(last_token.view())?;
@@ -1411,17 +1751,13 @@ impl ParakeetEOUModel {
         let state_h_value = ort::value::TensorRef::<f32>::from_array_view(state_h.view())?;
         let state_c_value = ort::value::TensorRef::<f32>::from_array_view(state_c.view())?;
 
-        self.decoder_binding
-            .bind_input("encoder_outputs", &encoder_outputs_value)?;
-        self.decoder_binding.bind_input("targets", &targets_value)?;
-        self.decoder_binding
-            .bind_input("target_length", &target_length_value)?;
-        self.decoder_binding
-            .bind_input("input_states_1", &state_h_value)?;
-        self.decoder_binding
-            .bind_input("input_states_2", &state_c_value)?;
+        decoder_binding.bind_input("encoder_outputs", &encoder_outputs_value)?;
+        decoder_binding.bind_input("targets", &targets_value)?;
+        decoder_binding.bind_input("target_length", &target_length_value)?;
+        decoder_binding.bind_input("input_states_1", &state_h_value)?;
+        decoder_binding.bind_input("input_states_2", &state_c_value)?;
 
-        let outputs = self.decoder_joint.run_binding(&self.decoder_binding)?;
+        let outputs = decoder_joint.run_binding(decoder_binding)?;
 
         // 1. Extract Logits
         let (l_shape, l_data) = outputs["outputs"]
