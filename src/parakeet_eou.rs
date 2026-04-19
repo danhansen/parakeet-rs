@@ -383,6 +383,36 @@ impl ParakeetEOU {
         self.model.end_profiling()
     }
 
+    /// Reset all streaming state for a new recognition session.
+    ///
+    /// This is intentionally stronger than the internal EOU reset, which keeps
+    /// encoder/audio context flowing across utterances within one session.
+    pub fn reset(&mut self) {
+        self.encoder_cache = EncoderCache::new(self.model.encoder_layout());
+        self.state_h.fill(0.0);
+        self.state_c.fill(0.0);
+        self.next_state_h.fill(0.0);
+        self.next_state_c.fill(0.0);
+        self.last_token.fill(self.blank_id);
+        self.mel_frame_cache.fill(0.0);
+        self.feature_window.fill(0.0);
+        self.preemphasis_buffer.fill(0.0);
+        self.spec.fill(0.0);
+        self.mel.fill(0.0);
+        self.new_mel_frames.fill(0.0);
+        self.features.fill(0.0);
+        self.encoder_out.fill(0.0);
+        self.decoder_frame.fill(0.0);
+        self.logits.fill(0.0);
+        self.fft_input.fill(0.0);
+        self.fft_output.fill(Complex32::new(0.0, 0.0));
+        self.fft_scratch.fill(Complex32::new(0.0, 0.0));
+        self.audio_buffer.clear();
+        self.chunk_counter = 0;
+        self.first_non_empty_emitted = false;
+        self.has_emitted_since_reset = false;
+    }
+
     fn build_feature_window(&mut self) {
         let pad = self
             .new_frame_window_samples
