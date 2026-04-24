@@ -210,7 +210,6 @@ pub struct LiteRtEncoderApi {
 }
 
 const LITERT_ENCODER_API_VERSION: u32 = 3;
-const LITERT_ENCODER_THREADS: usize = 2;
 static LITERT_ENCODER_API: Mutex<Option<LiteRtEncoderApi>> = Mutex::new(None);
 
 pub fn set_litert_encoder_api(api: *const LiteRtEncoderApi) -> bool {
@@ -1154,7 +1153,7 @@ impl ParakeetEOUModel {
                 litert_decoder_path.display()
             ));
             let litert_encoder =
-                LiteRtEncoderBackend::create(&litert_encoder_path, LITERT_ENCODER_THREADS)?
+                LiteRtEncoderBackend::create(&litert_encoder_path, exec_config.intra_threads)?
                     .ok_or_else(|| {
                         Error::Config(
                             "Full LiteRT model selected, but LiteRT encoder API is unavailable"
@@ -1168,7 +1167,7 @@ impl ParakeetEOUModel {
                 encoder_layout, encoder_cache_abi
             ));
             let litert_decoder =
-                LiteRtDecoderBackend::create(&litert_decoder_path, LITERT_ENCODER_THREADS)?
+                LiteRtDecoderBackend::create(&litert_decoder_path, exec_config.intra_threads)?
                     .ok_or_else(|| {
                         Error::Config(
                             "Full LiteRT model selected, but LiteRT decoder API is unavailable"
@@ -1559,9 +1558,9 @@ impl ParakeetEOUModel {
         let litert_encoder = if encoder_cache_abi == EncoderCacheAbi::RawChannel {
             android_log::info(format!(
                 "crate litert encoder create using threads={} ortIntraThreads={}",
-                LITERT_ENCODER_THREADS, exec_config.intra_threads
+                exec_config.intra_threads, exec_config.intra_threads
             ));
-            LiteRtEncoderBackend::create(&litert_encoder_path, LITERT_ENCODER_THREADS)?
+            LiteRtEncoderBackend::create(&litert_encoder_path, exec_config.intra_threads)?
         } else {
             if litert_encoder_path.exists() {
                 android_log::info(format!(
