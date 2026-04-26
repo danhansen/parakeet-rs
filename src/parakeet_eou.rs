@@ -330,6 +330,46 @@ impl ParakeetEOU {
                 let meta_kind = self.meta_token_kind(max_idx, token_text.as_deref());
                 let is_endpoint_meta = matches!(meta_kind, Some("eou") | Some("eob"));
 
+                if let Some(kind) = meta_kind {
+                    if is_endpoint_meta {
+                        eou_hits += 1;
+                        android_log::info(format!(
+                            "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
+                            kind,
+                            chunk_index,
+                            t,
+                            syms_added,
+                            max_val,
+                            emitted_tokens,
+                            text_output.len(),
+                            self.segment_has_text
+                        ));
+                        if detect_eou && (self.segment_has_text || !text_output.is_empty()) {
+                            self.segment_has_text = false;
+                            let decoder_ms = decoder_started_at.elapsed().as_millis();
+                            android_log::info(format!(
+                                "chunk idx={} featureMs={} encoderMs={} decoderMs={} decoderCalls={} blankBreaks={} emittedTokens={} eouHits={} cacheLen={} totalMs={} emittedTextLen={} endpoint=true",
+                                chunk_index,
+                                feature_ms,
+                                encoder_ms,
+                                decoder_ms,
+                                decoder_calls,
+                                blank_breaks,
+                                emitted_tokens,
+                                eou_hits,
+                                cache_len,
+                                chunk_started_at.elapsed().as_millis(),
+                                text_output.len()
+                            ));
+                            return Ok(ParakeetEOUChunk {
+                                text: text_output,
+                                endpoint_detected: true,
+                            });
+                        }
+                        break;
+                    }
+                }
+
                 self.state_h.assign(&self.next_state_h);
                 self.state_c.assign(&self.next_state_c);
                 self.last_token.fill(max_idx);
@@ -337,9 +377,6 @@ impl ParakeetEOU {
                 syms_added += 1;
 
                 if let Some(kind) = meta_kind {
-                    if is_endpoint_meta {
-                        eou_hits += 1;
-                    }
                     android_log::info(format!(
                         "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
                         kind,
@@ -351,31 +388,6 @@ impl ParakeetEOU {
                         text_output.len(),
                         self.segment_has_text
                     ));
-                    if is_endpoint_meta
-                        && detect_eou
-                        && (self.segment_has_text || !text_output.is_empty())
-                    {
-                        self.segment_has_text = false;
-                        let decoder_ms = decoder_started_at.elapsed().as_millis();
-                        android_log::info(format!(
-                            "chunk idx={} featureMs={} encoderMs={} decoderMs={} decoderCalls={} blankBreaks={} emittedTokens={} eouHits={} cacheLen={} totalMs={} emittedTextLen={} endpoint=true",
-                            chunk_index,
-                            feature_ms,
-                            encoder_ms,
-                            decoder_ms,
-                            decoder_calls,
-                            blank_breaks,
-                            emitted_tokens,
-                            eou_hits,
-                            cache_len,
-                            chunk_started_at.elapsed().as_millis(),
-                            text_output.len()
-                        ));
-                        return Ok(ParakeetEOUChunk {
-                            text: text_output,
-                            endpoint_detected: true,
-                        });
-                    }
                     continue;
                 }
 
