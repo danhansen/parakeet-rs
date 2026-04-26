@@ -30,6 +30,8 @@ const SLANEY_F_SP: f64 = 200.0 / 3.0;
 const SLANEY_MIN_LOG_HZ: f64 = 1000.0;
 const SLANEY_MIN_LOG_MEL: f64 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
 const SLANEY_LOG_STEP: f64 = 0.06875177742094912;
+const MAX_SYMBOLS_PER_STEP: usize = 10;
+const UNK_TOKEN_ID: i32 = 0;
 
 fn required_audio_samples(num_frames: usize) -> usize {
     if num_frames == 0 {
@@ -52,6 +54,7 @@ pub struct ParakeetEOU {
     last_token: Array2<i32>,
     blank_id: i32,
     eou_id: i32,
+    eob_id: Option<i32>,
     mel_basis: Array2<f32>,
     mel_frame_cache: Array2<f32>,
     feature_window: Vec<f32>,
@@ -124,9 +127,10 @@ impl ParakeetEOU {
             .token_to_id("<EOU>")
             .map(|id| id as i32)
             .unwrap_or(1024);
+        let eob_id = tokenizer.token_to_id("<EOB>").map(|id| id as i32);
         android_log::info(format!(
-            "crate tokenIds vocabSize={} blankId={} eouId={}",
-            vocab_size, blank_id, eou_id
+            "crate tokenIds vocabSize={} blankId={} eouId={} eobId={:?}",
+            vocab_size, blank_id, eou_id, eob_id
         ));
 
         let exec_config = config.unwrap_or_default();
@@ -171,6 +175,7 @@ impl ParakeetEOU {
             last_token: Array2::from_elem((1, 1), blank_id),
             blank_id,
             eou_id,
+            eob_id,
             mel_basis: Self::create_mel_filterbank(),
             mel_frame_cache: Array2::from_elem((N_MELS, PRE_ENCODE_CACHE), LOG_MEL_ZERO),
             feature_window: vec![0.0f32; FEATURE_WINDOW_SAMPLES],
@@ -289,7 +294,7 @@ impl ParakeetEOU {
                 .assign(&self.encoder_out.slice(s![.., .., t..t + 1]));
             let mut syms_added = 0;
 
-            while syms_added < 5 {
+            while syms_added < MAX_SYMBOLS_PER_STEP {
                 decoder_calls += 1;
                 self.model.run_decoder_into(
                     &self.decoder_frame,
@@ -317,33 +322,39 @@ impl ParakeetEOU {
                     break;
                 }
 
-                if max_idx == 0 {
-                    android_log::info(format!(
-                        "metaToken kind=unk chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={}",
-                        chunk_index,
-                        t,
-                        syms_added,
-                        max_val,
-                        emitted_tokens,
-                        text_output.len()
-                    ));
-                    blank_breaks += 1;
+                if max_idx as usize >= self.tokenizer.get_vocab_size(true) {
                     break;
                 }
 
-                if max_idx == self.eou_id {
-                    eou_hits += 1;
+                let token_text = self.tokenizer.id_to_token(max_idx as u32);
+                let meta_kind = self.meta_token_kind(max_idx, token_text.as_deref());
+                let is_endpoint_meta = matches!(meta_kind, Some("eou") | Some("eob"));
+
+                self.state_h.assign(&self.next_state_h);
+                self.state_c.assign(&self.next_state_c);
+                self.last_token.fill(max_idx);
+                emitted_tokens += 1;
+                syms_added += 1;
+
+                if let Some(kind) = meta_kind {
+                    if is_endpoint_meta {
+                        eou_hits += 1;
+                    }
                     android_log::info(format!(
-                        "metaToken kind=eou chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
+                        "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
+                        kind,
                         chunk_index,
                         t,
-                        syms_added,
+                        syms_added - 1,
                         max_val,
                         emitted_tokens,
                         text_output.len(),
                         self.segment_has_text
                     ));
-                    if detect_eou && (self.segment_has_text || !text_output.is_empty()) {
+                    if is_endpoint_meta
+                        && detect_eou
+                        && (self.segment_has_text || !text_output.is_empty())
+                    {
                         self.segment_has_text = false;
                         let decoder_ms = decoder_started_at.elapsed().as_millis();
                         android_log::info(format!(
@@ -365,23 +376,13 @@ impl ParakeetEOU {
                             endpoint_detected: true,
                         });
                     }
-                    break;
+                    continue;
                 }
-
-                if max_idx as usize >= self.tokenizer.get_vocab_size(true) {
-                    break;
-                }
-
-                self.state_h.assign(&self.next_state_h);
-                self.state_c.assign(&self.next_state_c);
-                self.last_token.fill(max_idx);
 
                 if let Ok(decoded) = self.tokenizer.decode(&[max_idx as u32], true) {
                     text_output.push_str(&decoded);
                 }
-                emitted_tokens += 1;
                 self.segment_has_text = true;
-                syms_added += 1;
             }
         }
         let decoder_ms = decoder_started_at.elapsed().as_millis();
@@ -474,6 +475,20 @@ impl ParakeetEOU {
             .as_slice()
             .and_then(|values| values.first().copied())
             .unwrap_or(-1)
+    }
+
+    fn meta_token_kind(&self, token_id: i32, token_text: Option<&str>) -> Option<&'static str> {
+        if token_id == UNK_TOKEN_ID {
+            Some("unk")
+        } else if token_id == self.eou_id {
+            Some("eou")
+        } else if self.eob_id == Some(token_id) {
+            Some("eob")
+        } else if token_text.map_or(false, is_angle_bracket_meta_token) {
+            Some("special")
+        } else {
+            None
+        }
     }
 
     fn extract_new_mel_frames(&mut self) -> Result<()> {
@@ -616,6 +631,10 @@ impl ParakeetEOU {
     }
 }
 
+fn is_angle_bracket_meta_token(token: &str) -> bool {
+    token.starts_with('<') && token.ends_with('>')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +642,13 @@ mod tests {
     #[test]
     fn log_mel_zero_matches_nemo_silence_value() {
         assert!((LOG_MEL_ZERO - LOG_ZERO_GUARD.ln()).abs() < 0.001);
+    }
+
+    #[test]
+    fn angle_bracket_tokens_are_meta_tokens() {
+        assert!(is_angle_bracket_meta_token("<EOB>"));
+        assert!(is_angle_bracket_meta_token("<custom>"));
+        assert!(!is_angle_bracket_meta_token("▁hello"));
     }
 
     #[test]
