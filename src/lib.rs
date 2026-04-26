@@ -89,7 +89,7 @@ pub use model_eou::{set_litert_encoder_api, LiteRtEncoderApi, ParakeetEOUModel};
 pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
 pub use model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
 pub use nemotron::{Nemotron, SentencePieceVocab};
-pub use parakeet_eou::ParakeetEOU;
+pub use parakeet_eou::{ParakeetEOU, ParakeetEOUChunk};
 pub use parakeet_unified::{ParakeetUnified, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]

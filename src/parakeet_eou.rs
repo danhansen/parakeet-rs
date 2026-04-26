@@ -70,6 +70,12 @@ pub struct ParakeetEOU {
     segment_has_text: bool,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ParakeetEOUChunk {
+    pub text: String,
+    pub endpoint_detected: bool,
+}
+
 impl ParakeetEOU {
     /// Load Parakeet EOU model from path
     ///
@@ -201,7 +207,7 @@ impl ParakeetEOU {
     ///
     /// # Arguments
     /// * `chunk` - Audio chunk (typically 160ms / 2560 samples at 16kHz)
-    /// * `emit_eou_marker` - If true, append an EOU marker when the model detects an
+    /// * `detect_eou` - If true, mark the result when the model detects an
     ///   utterance boundary after text has been emitted for the current segment.
     ///
     /// # Streaming Behavior
@@ -209,7 +215,7 @@ impl ParakeetEOU {
     /// - Maintains only the raw-audio tail required for the next fresh mel frames
     /// - Reuses the previous mel-frame cache for encoder pre-encode context
     /// - Sends (pre_encode_cache + new_frames) mel frames to the encoder
-    pub fn transcribe(&mut self, chunk: &[f32], emit_eou_marker: bool) -> Result<String> {
+    pub fn transcribe(&mut self, chunk: &[f32], detect_eou: bool) -> Result<ParakeetEOUChunk> {
         let chunk_started_at = Instant::now();
         self.chunk_counter += 1;
         let chunk_index = self.chunk_counter;
@@ -230,7 +236,7 @@ impl ParakeetEOU {
                 WIN_LENGTH,
                 chunk_started_at.elapsed().as_millis()
             ));
-            return Ok(String::new());
+            return Ok(ParakeetEOUChunk::default());
         }
 
         self.build_feature_window();
@@ -263,7 +269,7 @@ impl ParakeetEOU {
         ]));
 
         if total_frames == 0 {
-            return Ok(String::new());
+            return Ok(ParakeetEOUChunk::default());
         }
 
         let mut text_output = String::new();
@@ -332,7 +338,7 @@ impl ParakeetEOU {
                         text_output.len(),
                         self.segment_has_text
                     ));
-                    if emit_eou_marker && (self.segment_has_text || !text_output.is_empty()) {
+                    if detect_eou && (self.segment_has_text || !text_output.is_empty()) {
                         self.segment_has_text = false;
                         let decoder_ms = decoder_started_at.elapsed().as_millis();
                         android_log::info(format!(
@@ -349,7 +355,10 @@ impl ParakeetEOU {
                             chunk_started_at.elapsed().as_millis(),
                             text_output.len()
                         ));
-                        return Ok(text_output + " [EOU]");
+                        return Ok(ParakeetEOUChunk {
+                            text: text_output,
+                            endpoint_detected: true,
+                        });
                     }
                     break;
                 }
@@ -401,7 +410,10 @@ impl ParakeetEOU {
             chunk_started_at.elapsed().as_millis(),
             text_output.len()
         ));
-        Ok(text_output)
+        Ok(ParakeetEOUChunk {
+            text: text_output,
+            endpoint_detected: false,
+        })
     }
 
     pub fn end_profiling(&mut self) -> Result<Vec<String>> {
