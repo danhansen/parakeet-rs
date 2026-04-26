@@ -323,7 +323,6 @@ impl ParakeetEOU {
                             chunk_started_at.elapsed().as_millis(),
                             text_output.len()
                         ));
-                        self.reset_states();
                         return Ok(text_output + " [EOU]");
                     }
                     break;
@@ -424,18 +423,6 @@ impl ParakeetEOU {
         {
             *dst = sample;
         }
-    }
-
-    fn reset_states(&mut self) {
-        // Soft reset: Only reset decoder states
-        // at this state, we need to keep encoder cache and audio buffer flowing for continuous context
-        // self.encoder_cache = EncoderCache::new();  // DON'T reset!!!
-        self.state_h.fill(0.0);
-        self.state_c.fill(0.0);
-        self.last_token.fill(self.blank_id);
-        self.first_non_empty_emitted = false;
-        self.has_emitted_since_reset = false;
-        // self.audio_buffer.clear();  // DON'T clear!!
     }
 
     fn encoder_cache_len(&self) -> i64 {
