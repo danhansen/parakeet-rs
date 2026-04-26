@@ -392,6 +392,15 @@ impl ParakeetEOU {
                 }
 
                 if let Ok(decoded) = self.tokenizer.decode(&[max_idx as u32], true) {
+                    android_log::info(format!(
+                        "tokenTrace chunk={} frame={} symbol={} id={} piece=\"{}\" decoded=\"{}\"",
+                        chunk_index,
+                        t,
+                        syms_added - 1,
+                        max_idx,
+                        sanitize_for_log(token_text.as_deref().unwrap_or("")),
+                        sanitize_for_log(&decoded)
+                    ));
                     text_output.push_str(&decoded);
                 }
                 self.segment_has_text = true;
@@ -645,6 +654,16 @@ impl ParakeetEOU {
 
 fn is_angle_bracket_meta_token(token: &str) -> bool {
     token.starts_with('<') && token.ends_with('>')
+}
+
+fn sanitize_for_log(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' => ' ',
+            '"' => '\'',
+            _ => ch,
+        })
+        .collect()
 }
 
 #[cfg(test)]
