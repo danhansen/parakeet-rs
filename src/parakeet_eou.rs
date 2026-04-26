@@ -18,6 +18,7 @@ const HOP_LENGTH: usize = 160;
 const N_MELS: usize = 128;
 const PREEMPH: f32 = 0.97;
 const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+const LOG_MEL_ZERO: f32 = -16.635;
 const FMAX: f32 = 8000.0;
 const PRE_ENCODE_CACHE: usize = 9;
 const FRAMES_PER_CHUNK: usize = 16;
@@ -25,6 +26,10 @@ const SLICE_LEN: usize = PRE_ENCODE_CACHE + FRAMES_PER_CHUNK;
 const FREQ_BINS: usize = N_FFT / 2 + 1;
 const FEATURE_WINDOW_SAMPLES: usize = (FRAMES_PER_CHUNK - 1) * HOP_LENGTH + WIN_LENGTH;
 const STFT_FRAMES: usize = 1 + (FEATURE_WINDOW_SAMPLES + N_FFT - WIN_LENGTH) / HOP_LENGTH;
+const SLANEY_F_SP: f64 = 200.0 / 3.0;
+const SLANEY_MIN_LOG_HZ: f64 = 1000.0;
+const SLANEY_MIN_LOG_MEL: f64 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
+const SLANEY_LOG_STEP: f64 = 0.06875177742094912;
 
 fn required_audio_samples(num_frames: usize) -> usize {
     if num_frames == 0 {
@@ -167,7 +172,7 @@ impl ParakeetEOU {
             blank_id,
             eou_id,
             mel_basis: Self::create_mel_filterbank(),
-            mel_frame_cache: Array2::zeros((N_MELS, PRE_ENCODE_CACHE)),
+            mel_frame_cache: Array2::from_elem((N_MELS, PRE_ENCODE_CACHE), LOG_MEL_ZERO),
             feature_window: vec![0.0f32; FEATURE_WINDOW_SAMPLES],
             preemphasis_buffer: vec![0.0f32; FEATURE_WINDOW_SAMPLES],
             spec: Array2::zeros((FREQ_BINS, STFT_FRAMES)),
@@ -431,7 +436,7 @@ impl ParakeetEOU {
         self.next_state_h.fill(0.0);
         self.next_state_c.fill(0.0);
         self.last_token.fill(self.blank_id);
-        self.mel_frame_cache.fill(0.0);
+        self.mel_frame_cache.fill(LOG_MEL_ZERO);
         self.feature_window.fill(0.0);
         self.preemphasis_buffer.fill(0.0);
         self.spec.fill(0.0);
@@ -555,14 +560,30 @@ impl ParakeetEOU {
     fn create_mel_filterbank() -> Array2<f32> {
         let num_freqs = N_FFT / 2 + 1;
 
-        let hz_to_mel = |hz: f32| 2595.0 * (1.0 + hz / 700.0).log10();
-        let mel_to_hz = |mel: f32| 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0);
+        fn hz_to_mel_slaney(hz: f64) -> f64 {
+            if hz < SLANEY_MIN_LOG_HZ {
+                hz / SLANEY_F_SP
+            } else {
+                SLANEY_MIN_LOG_MEL + (hz / SLANEY_MIN_LOG_HZ).ln() / SLANEY_LOG_STEP
+            }
+        }
 
-        let mel_min = hz_to_mel(0.0);
-        let mel_max = hz_to_mel(FMAX);
+        fn mel_to_hz_slaney(mel: f64) -> f64 {
+            if mel < SLANEY_MIN_LOG_MEL {
+                mel * SLANEY_F_SP
+            } else {
+                SLANEY_MIN_LOG_HZ * ((mel - SLANEY_MIN_LOG_MEL) * SLANEY_LOG_STEP).exp()
+            }
+        }
+
+        let mel_min = hz_to_mel_slaney(0.0);
+        let mel_max = hz_to_mel_slaney(FMAX as f64);
 
         let mel_points: Vec<f32> = (0..=N_MELS + 1)
-            .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f32 / (N_MELS + 1) as f32))
+            .map(|i| {
+                mel_to_hz_slaney(mel_min + (mel_max - mel_min) * i as f64 / (N_MELS + 1) as f64)
+                    as f32
+            })
             .collect();
 
         let fft_freqs: Vec<f32> = (0..num_freqs)
@@ -592,5 +613,25 @@ impl ParakeetEOU {
         }
 
         weights
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_mel_zero_matches_nemo_silence_value() {
+        assert!((LOG_MEL_ZERO - LOG_ZERO_GUARD.ln()).abs() < 0.001);
+    }
+
+    #[test]
+    fn eou_mel_filterbank_uses_slaney_spacing() {
+        let weights = ParakeetEOU::create_mel_filterbank();
+
+        assert_eq!(weights.shape(), &[N_MELS, FREQ_BINS]);
+        assert!((weights[[0, 1]] - 0.028_377_543).abs() < 1.0e-6);
+        assert!((weights[[1, 1]] - 0.014_389_008).abs() < 1.0e-6);
+        assert!((weights[[5, 5]] - 0.013_588_061).abs() < 1.0e-6);
     }
 }
