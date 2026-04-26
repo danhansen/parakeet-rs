@@ -300,13 +300,37 @@ impl ParakeetEOU {
                     }
                 }
 
-                if max_idx == self.blank_id || max_idx == 0 {
+                if max_idx == self.blank_id {
+                    blank_breaks += 1;
+                    break;
+                }
+
+                if max_idx == 0 {
+                    android_log::info(format!(
+                        "metaToken kind=unk chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={}",
+                        chunk_index,
+                        t,
+                        syms_added,
+                        max_val,
+                        emitted_tokens,
+                        text_output.len()
+                    ));
                     blank_breaks += 1;
                     break;
                 }
 
                 if max_idx == self.eou_id {
                     eou_hits += 1;
+                    android_log::info(format!(
+                        "metaToken kind=eou chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} hasEmittedSinceReset={}",
+                        chunk_index,
+                        t,
+                        syms_added,
+                        max_val,
+                        emitted_tokens,
+                        text_output.len(),
+                        self.has_emitted_since_reset
+                    ));
                     if reset_on_eou && (self.has_emitted_since_reset || !text_output.is_empty()) {
                         let decoder_ms = decoder_started_at.elapsed().as_millis();
                         android_log::info(format!(
