@@ -326,22 +326,9 @@ impl ParakeetEOU {
                 let meta_kind = self.meta_token_kind(max_idx, token_text.as_deref());
                 let is_endpoint_meta = matches!(meta_kind, Some("eou") | Some("eob"));
 
-                if let Some(kind) = meta_kind {
-                    if is_endpoint_meta {
-                        eou_hits += 1;
-                        endpoint_detected = true;
-                        android_log::info(format!(
-                            "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={}",
-                            kind,
-                            chunk_index,
-                            t,
-                            syms_added,
-                            max_val,
-                            emitted_tokens,
-                            text_output.len()
-                        ));
-                        break;
-                    }
+                if is_endpoint_meta {
+                    eou_hits += 1;
+                    endpoint_detected = true;
                 }
 
                 self.state_h.assign(&self.next_state_h);
