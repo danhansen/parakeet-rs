@@ -75,7 +75,6 @@ pub struct ParakeetEOU {
     fft_scratch: Vec<Complex32>,
     chunk_counter: u64,
     first_non_empty_emitted: bool,
-    segment_has_text: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -204,7 +203,6 @@ impl ParakeetEOU {
             fft_scratch,
             chunk_counter: 0,
             first_non_empty_emitted: false,
-            segment_has_text: false,
         };
         android_log::info(format!(
             "crate from_pretrained ready elapsedMs={}",
@@ -217,15 +215,12 @@ impl ParakeetEOU {
     ///
     /// # Arguments
     /// * `chunk` - Audio chunk (typically 160ms / 2560 samples at 16kHz)
-    /// * `detect_eou` - If true, mark the result when the model detects an
-    ///   utterance boundary after text has been emitted for the current segment.
-    ///
     /// # Streaming Behavior
     /// Cache-aware streaming
     /// - Maintains only the raw-audio tail required for the next fresh mel frames
     /// - Reuses the previous mel-frame cache for encoder pre-encode context
     /// - Sends (pre_encode_cache + new_frames) mel frames to the encoder
-    pub fn transcribe(&mut self, chunk: &[f32], detect_eou: bool) -> Result<ParakeetEOUChunk> {
+    pub fn transcribe(&mut self, chunk: &[f32]) -> Result<ParakeetEOUChunk> {
         let chunk_started_at = Instant::now();
         self.chunk_counter += 1;
         let chunk_index = self.chunk_counter;
@@ -288,6 +283,7 @@ impl ParakeetEOU {
         let mut blank_breaks = 0usize;
         let mut emitted_tokens = 0usize;
         let mut eou_hits = 0usize;
+        let mut endpoint_detected = false;
 
         for t in 0..total_frames {
             self.decoder_frame
@@ -333,39 +329,17 @@ impl ParakeetEOU {
                 if let Some(kind) = meta_kind {
                     if is_endpoint_meta {
                         eou_hits += 1;
+                        endpoint_detected = true;
                         android_log::info(format!(
-                            "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
+                            "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={}",
                             kind,
                             chunk_index,
                             t,
                             syms_added,
                             max_val,
                             emitted_tokens,
-                            text_output.len(),
-                            self.segment_has_text
+                            text_output.len()
                         ));
-                        if detect_eou && (self.segment_has_text || !text_output.is_empty()) {
-                            self.segment_has_text = false;
-                            let decoder_ms = decoder_started_at.elapsed().as_millis();
-                            android_log::info(format!(
-                                "chunk idx={} featureMs={} encoderMs={} decoderMs={} decoderCalls={} blankBreaks={} emittedTokens={} eouHits={} cacheLen={} totalMs={} emittedTextLen={} endpoint=true",
-                                chunk_index,
-                                feature_ms,
-                                encoder_ms,
-                                decoder_ms,
-                                decoder_calls,
-                                blank_breaks,
-                                emitted_tokens,
-                                eou_hits,
-                                cache_len,
-                                chunk_started_at.elapsed().as_millis(),
-                                text_output.len()
-                            ));
-                            return Ok(ParakeetEOUChunk {
-                                text: text_output,
-                                endpoint_detected: true,
-                            });
-                        }
                         break;
                     }
                 }
@@ -378,15 +352,14 @@ impl ParakeetEOU {
 
                 if let Some(kind) = meta_kind {
                     android_log::info(format!(
-                        "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={} segmentHasText={}",
+                        "metaToken kind={} chunk={} frame={} symbol={} logit={} emittedTokens={} textLen={}",
                         kind,
                         chunk_index,
                         t,
                         syms_added - 1,
                         max_val,
                         emitted_tokens,
-                        text_output.len(),
-                        self.segment_has_text
+                        text_output.len()
                     ));
                     continue;
                 }
@@ -403,7 +376,6 @@ impl ParakeetEOU {
                     ));
                     text_output.push_str(&decoded);
                 }
-                self.segment_has_text = true;
             }
         }
         let decoder_ms = decoder_started_at.elapsed().as_millis();
@@ -424,7 +396,7 @@ impl ParakeetEOU {
             ));
         }
         android_log::info(format!(
-            "chunk idx={} featureMs={} encoderMs={} decoderMs={} decoderCalls={} blankBreaks={} emittedTokens={} eouHits={} cacheLen={} totalMs={} emittedTextLen={} endpoint=false",
+            "chunk idx={} featureMs={} encoderMs={} decoderMs={} decoderCalls={} blankBreaks={} emittedTokens={} eouHits={} cacheLen={} totalMs={} emittedTextLen={} endpoint={}",
             chunk_index,
             feature_ms,
             encoder_ms,
@@ -435,11 +407,12 @@ impl ParakeetEOU {
             eou_hits,
             cache_len,
             chunk_started_at.elapsed().as_millis(),
-            text_output.len()
+            text_output.len(),
+            endpoint_detected
         ));
         Ok(ParakeetEOUChunk {
             text: text_output,
-            endpoint_detected: false,
+            endpoint_detected,
         })
     }
 
@@ -449,8 +422,8 @@ impl ParakeetEOU {
 
     /// Reset all streaming state for a new recognition session.
     ///
-    /// EOU detection finalizes text, but it does not reset model state; this
-    /// reset is reserved for a new recognition session.
+    /// Endpoint detection does not reset model state; this reset is reserved
+    /// for a new recognition session.
     pub fn reset(&mut self) {
         self.encoder_cache = EncoderCache::new(self.model.encoder_layout());
         self.state_h.fill(0.0);
@@ -474,7 +447,6 @@ impl ParakeetEOU {
         self.audio_buffer.clear();
         self.chunk_counter = 0;
         self.first_non_empty_emitted = false;
-        self.segment_has_text = false;
     }
 
     fn build_feature_window(&mut self) {

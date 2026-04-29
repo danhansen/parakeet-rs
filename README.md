@@ -50,7 +50,7 @@ let audio: Vec<f32> = /* your audio samples */;
 // Process in 160ms chunks for streaming
 const CHUNK_SIZE: usize = 2560; // 160ms at 16kHz
 for chunk in audio.chunks(CHUNK_SIZE) {
-    let result = parakeet.transcribe(chunk, true)?;
+    let result = parakeet.transcribe(chunk)?;
     print!("{}", result.text);
     if result.endpoint_detected {
         println!();

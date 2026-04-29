@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut full_text = String::new();
 
         for chunk in audio.chunks(chunk_size) {
-            let result = model.transcribe(&chunk.to_vec(), false)?;
+            let result = model.transcribe(&chunk.to_vec())?;
             if !result.text.is_empty() {
                 print!("{}", result.text);
                 std::io::stdout().flush()?;
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Flush
         for _ in 0..3 {
-            let result = model.transcribe(&vec![0.0; chunk_size], false)?;
+            let result = model.transcribe(&vec![0.0; chunk_size])?;
             if !result.text.is_empty() {
                 print!("{}", result.text);
                 full_text.push_str(&result.text);
