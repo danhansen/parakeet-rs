@@ -364,14 +364,15 @@ impl ParakeetEOU {
                     continue;
                 }
 
-                if let Ok(decoded) = self.tokenizer.decode(&[max_idx as u32], true) {
+                if let Some(piece) = token_text.as_deref() {
+                    let decoded = decode_nemo_sentencepiece_piece(piece);
                     android_log::info(format!(
                         "tokenTrace chunk={} frame={} symbol={} id={} piece=\"{}\" decoded=\"{}\"",
                         chunk_index,
                         t,
                         syms_added - 1,
                         max_idx,
-                        sanitize_for_log(token_text.as_deref().unwrap_or("")),
+                        sanitize_for_log(piece),
                         sanitize_for_log(&decoded)
                     ));
                     text_output.push_str(&decoded);
@@ -628,6 +629,14 @@ fn is_angle_bracket_meta_token(token: &str) -> bool {
     token.starts_with('<') && token.ends_with('>')
 }
 
+fn decode_nemo_sentencepiece_piece(piece: &str) -> String {
+    if piece.starts_with('▁') {
+        piece.replace('▁', " ")
+    } else {
+        piece.to_string()
+    }
+}
+
 fn sanitize_for_log(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {
@@ -652,6 +661,16 @@ mod tests {
         assert!(is_angle_bracket_meta_token("<EOB>"));
         assert!(is_angle_bracket_meta_token("<custom>"));
         assert!(!is_angle_bracket_meta_token("▁hello"));
+    }
+
+    #[test]
+    fn eou_detokenization_matches_nemo_sentencepiece_spacing() {
+        let pieces = ["▁sev", "en", "▁th", "irty"];
+        let decoded = pieces
+            .iter()
+            .map(|piece| decode_nemo_sentencepiece_piece(piece))
+            .collect::<String>();
+        assert_eq!(decoded, " seven thirty");
     }
 
     #[test]
