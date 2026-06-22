@@ -51,6 +51,9 @@ pub struct ModelConfig {
     pub intra_threads: usize,
     pub inter_threads: usize,
     pub graph_optimization: GraphOptimization,
+    pub memory_pattern: Option<bool>,
+    pub parallel_execution: bool,
+    pub cpu_arena: Option<bool>,
     pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
@@ -65,6 +68,9 @@ impl fmt::Debug for ModelConfig {
             .field("intra_threads", &self.intra_threads)
             .field("inter_threads", &self.inter_threads)
             .field("graph_optimization", &self.graph_optimization)
+            .field("memory_pattern", &self.memory_pattern)
+            .field("parallel_execution", &self.parallel_execution)
+            .field("cpu_arena", &self.cpu_arena)
             .field(
                 "configure",
                 &if self.configure.is_some() {
@@ -85,6 +91,9 @@ impl Default for ModelConfig {
             intra_threads: 4,
             inter_threads: 1,
             graph_optimization: GraphOptimization::default(),
+            memory_pattern: None,
+            parallel_execution: false,
+            cpu_arena: None,
             configure: None,
             coreml_cache_dir: None,
         }
@@ -113,6 +122,21 @@ impl ModelConfig {
 
     pub fn with_graph_optimization(mut self, level: GraphOptimization) -> Self {
         self.graph_optimization = level;
+        self
+    }
+
+    pub fn with_memory_pattern(mut self, enabled: Option<bool>) -> Self {
+        self.memory_pattern = enabled;
+        self
+    }
+
+    pub fn with_parallel_execution(mut self, enabled: bool) -> Self {
+        self.parallel_execution = enabled;
+        self
+    }
+
+    pub fn with_cpu_arena(mut self, enabled: Option<bool>) -> Self {
+        self.cpu_arena = enabled;
         self
     }
 
@@ -160,8 +184,25 @@ impl ModelConfig {
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
 
+        if let Some(memory_pattern) = self.memory_pattern {
+            builder = builder.with_memory_pattern(memory_pattern)?;
+        }
+        if self.parallel_execution {
+            builder = builder.with_parallel_execution(true)?;
+        }
+
         builder = match self.execution_provider {
-            ExecutionProvider::Cpu => builder,
+            ExecutionProvider::Cpu => {
+                if let Some(cpu_arena) = self.cpu_arena {
+                    builder.with_execution_providers([
+                        ort::ep::CPU::default()
+                            .with_arena_allocator(cpu_arena)
+                            .build(),
+                    ])?
+                } else {
+                    builder
+                }
+            }
 
             #[cfg(feature = "cuda")]
             ExecutionProvider::Cuda => builder.with_execution_providers([
