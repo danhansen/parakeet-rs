@@ -35,11 +35,22 @@ pub enum ExecutionProvider {
     NNAPI,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphOptimization {
+    Disable,
+    Level1,
+    Level2,
+    #[default]
+    Level3,
+    All,
+}
+
 #[derive(Clone)]
 pub struct ModelConfig {
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
+    pub graph_optimization: GraphOptimization,
     pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
@@ -53,6 +64,7 @@ impl fmt::Debug for ModelConfig {
             .field("execution_provider", &self.execution_provider)
             .field("intra_threads", &self.intra_threads)
             .field("inter_threads", &self.inter_threads)
+            .field("graph_optimization", &self.graph_optimization)
             .field(
                 "configure",
                 &if self.configure.is_some() {
@@ -72,6 +84,7 @@ impl Default for ModelConfig {
             execution_provider: ExecutionProvider::default(),
             intra_threads: 4,
             inter_threads: 1,
+            graph_optimization: GraphOptimization::default(),
             configure: None,
             coreml_cache_dir: None,
         }
@@ -95,6 +108,11 @@ impl ModelConfig {
 
     pub fn with_inter_threads(mut self, threads: usize) -> Self {
         self.inter_threads = threads;
+        self
+    }
+
+    pub fn with_graph_optimization(mut self, level: GraphOptimization) -> Self {
+        self.graph_optimization = level;
         self
     }
 
@@ -130,8 +148,15 @@ impl ModelConfig {
         use ort::ep::CPU as CPUExecutionProvider;
         use ort::session::builder::GraphOptimizationLevel;
 
+        let graph_optimization = match self.graph_optimization {
+            GraphOptimization::Disable => GraphOptimizationLevel::Disable,
+            GraphOptimization::Level1 => GraphOptimizationLevel::Level1,
+            GraphOptimization::Level2 => GraphOptimizationLevel::Level2,
+            GraphOptimization::Level3 => GraphOptimizationLevel::Level3,
+            GraphOptimization::All => GraphOptimizationLevel::All,
+        };
         let mut builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(graph_optimization)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
 
