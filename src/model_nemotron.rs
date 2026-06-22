@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use ndarray::{s, Array1, Array2, Array3, Array4};
+use ndarray::{Array1, Array3, Array4};
 use ort::session::{Session, SessionInputValue};
-use ort::value::ValueType;
+use ort::value::{TensorRef, ValueType};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -198,20 +198,42 @@ impl NemotronModel {
         cache: &NemotronEncoderCache,
         prompt_index: Option<i64>,
     ) -> Result<(Array3<f32>, i64, NemotronEncoderCache)> {
-        let length_arr = Array1::from_vec(vec![length]);
+        let mut new_cache = cache.clone();
+        let (encoded, encoded_len) =
+            self.run_encoder_into(features, length, &mut new_cache, prompt_index)?;
+        Ok((encoded, encoded_len, new_cache))
+    }
+
+    /// Run encoder with cache-aware streaming and update `cache` in place.
+    pub fn run_encoder_into(
+        &mut self,
+        features: &Array3<f32>,
+        length: i64,
+        cache: &mut NemotronEncoderCache,
+        prompt_index: Option<i64>,
+    ) -> Result<(Array3<f32>, i64)> {
+        let length_arr = [length];
+        let features_value = TensorRef::<f32>::from_array_view(features.view())?;
+        let length_value = TensorRef::<i64>::from_array_view(([1usize], &length_arr[..]))?;
+        let cache_last_channel_value =
+            TensorRef::<f32>::from_array_view(cache.cache_last_channel.view())?;
+        let cache_last_time_value = TensorRef::<f32>::from_array_view(cache.cache_last_time.view())?;
+        let cache_last_channel_len_value =
+            TensorRef::<i64>::from_array_view(cache.cache_last_channel_len.view())?;
 
         let mut inputs = ort::inputs![
-            "processed_signal" => ort::value::Value::from_array(features.clone())?,
-            "processed_signal_length" => ort::value::Value::from_array(length_arr)?,
-            "cache_last_channel" => ort::value::Value::from_array(cache.cache_last_channel.clone())?,
-            "cache_last_time" => ort::value::Value::from_array(cache.cache_last_time.clone())?,
-            "cache_last_channel_len" => ort::value::Value::from_array(cache.cache_last_channel_len.clone())?
+            "processed_signal" => features_value,
+            "processed_signal_length" => length_value,
+            "cache_last_channel" => cache_last_channel_value,
+            "cache_last_time" => cache_last_time_value,
+            "cache_last_channel_len" => cache_last_channel_len_value
         ];
-        if let Some(idx) = prompt_index {
-            let prompt_arr = Array1::from_vec(vec![idx]);
+        let prompt_arr = prompt_index.map(|idx| [idx]);
+        if let Some(prompt_arr) = prompt_arr.as_ref() {
+            let prompt_value = TensorRef::<i64>::from_array_view(([1usize], &prompt_arr[..]))?;
             inputs.push((
                 Cow::Borrowed("prompt_index"),
-                SessionInputValue::from(ort::value::Value::from_array(prompt_arr)?),
+                SessionInputValue::from(prompt_value),
             ));
         }
         if self.has_projected_kv_cache {
@@ -220,17 +242,22 @@ impl NemotronModel {
             })?;
             let layers = projected.key.shape()[0];
             for layer in 0..layers {
+                let key = TensorRef::<f32>::from_array_view((
+                    [1usize, projected.key.shape()[2], projected.key.shape()[3]],
+                    projected_layer_slice(&projected.key, layer)?,
+                ))?;
                 inputs.push((
                     Cow::Owned(format!("cache_key_layer_{layer}")),
-                    SessionInputValue::from(ort::value::Value::from_array(
-                        projected.key.slice(s![layer, .., .., ..]).to_owned(),
-                    )?),
+                    SessionInputValue::from(key),
                 ));
+
+                let value = TensorRef::<f32>::from_array_view((
+                    [1usize, projected.value.shape()[2], projected.value.shape()[3]],
+                    projected_layer_slice(&projected.value, layer)?,
+                ))?;
                 inputs.push((
                     Cow::Owned(format!("cache_value_layer_{layer}")),
-                    SessionInputValue::from(ort::value::Value::from_array(
-                        projected.value.slice(s![layer, .., .., ..]).to_owned(),
-                    )?),
+                    SessionInputValue::from(value),
                 ));
             }
         }
@@ -268,9 +295,8 @@ impl NemotronModel {
             .try_extract_tensor::<i64>()
             .map_err(|e| Error::Model(format!("Failed to extract cache_len: {e}")))?;
 
-        let mut projected_kv = cache.projected_kv.clone();
         if self.has_projected_kv_cache {
-            let projected = projected_kv.as_mut().ok_or_else(|| {
+            let projected = cache.projected_kv.as_mut().ok_or_else(|| {
                 Error::Model("projected K/V cache graph returned outputs but cache state is missing".into())
             })?;
             for layer in 0..self.config.num_encoder_layers {
@@ -279,65 +305,40 @@ impl NemotronModel {
                 let (key_shape, key_data) = outputs[key_name.as_str()]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| Error::Model(format!("Failed to extract {key_name}: {e}")))?;
-                let key = Array3::from_shape_vec(
-                    (
-                        key_shape[0] as usize,
-                        key_shape[1] as usize,
-                        key_shape[2] as usize,
-                    ),
-                    key_data.to_vec(),
-                )
-                .map_err(|e| Error::Model(format!("Failed to reshape {key_name}: {e}")))?;
-                roll_projected_layer(&mut projected.key, layer, &key)?;
+                roll_projected_layer_from_slice(&mut projected.key, layer, key_shape.as_ref(), key_data)?;
 
                 let (value_shape, value_data) = outputs[value_name.as_str()]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| Error::Model(format!("Failed to extract {value_name}: {e}")))?;
-                let value = Array3::from_shape_vec(
-                    (
-                        value_shape[0] as usize,
-                        value_shape[1] as usize,
-                        value_shape[2] as usize,
-                    ),
-                    value_data.to_vec(),
-                )
-                .map_err(|e| Error::Model(format!("Failed to reshape {value_name}: {e}")))?;
-                roll_projected_layer(&mut projected.value, layer, &value)?;
+                roll_projected_layer_from_slice(
+                    &mut projected.value,
+                    layer,
+                    value_shape.as_ref(),
+                    value_data,
+                )?;
             }
         }
 
-        let new_cache = NemotronEncoderCache {
-            cache_last_channel: Array4::from_shape_vec(
-                (
-                    ch_shape[0] as usize,
-                    ch_shape[1] as usize,
-                    ch_shape[2] as usize,
-                    ch_shape[3] as usize,
-                ),
-                ch_data.to_vec(),
-            )
-            .map_err(|e| Error::Model(format!("Failed to reshape cache_last_channel: {e}")))?,
+        copy_output_to_array4(
+            "cache_last_channel",
+            &mut cache.cache_last_channel,
+            ch_shape.as_ref(),
+            ch_data,
+        )?;
+        copy_output_to_array4(
+            "cache_last_time",
+            &mut cache.cache_last_time,
+            tm_shape.as_ref(),
+            tm_data,
+        )?;
+        copy_output_to_array1_i64(
+            "cache_last_channel_len",
+            &mut cache.cache_last_channel_len,
+            len_shape.as_ref(),
+            len_data,
+        )?;
 
-            cache_last_time: Array4::from_shape_vec(
-                (
-                    tm_shape[0] as usize,
-                    tm_shape[1] as usize,
-                    tm_shape[2] as usize,
-                    tm_shape[3] as usize,
-                ),
-                tm_data.to_vec(),
-            )
-            .map_err(|e| Error::Model(format!("Failed to reshape cache_last_time: {e}")))?,
-
-            cache_last_channel_len: Array1::from_shape_vec(
-                len_shape[0] as usize,
-                len_data.to_vec(),
-            )
-            .map_err(|e| Error::Model(format!("Failed to reshape cache_len: {e}")))?,
-            projected_kv,
-        };
-
-        Ok((encoder_out, encoded_len, new_cache))
+        Ok((encoder_out, encoded_len))
     }
 
     /// Run decoder step.
@@ -349,16 +350,20 @@ impl NemotronModel {
         state_1: &Array3<f32>, // [2, 1, 640]
         state_2: &Array3<f32>, // [2, 1, 640]
     ) -> Result<(Array1<f32>, Array3<f32>, Array3<f32>)> {
-        let targets = Array2::from_shape_vec((1, 1), vec![target_token])
-            .map_err(|e| Error::Model(format!("Failed to create targets: {e}")))?;
-        let target_len = Array1::from_vec(vec![1i32]);
+        let targets = [target_token];
+        let target_len = [1i32];
+        let encoder_frame_value = TensorRef::<f32>::from_array_view(encoder_frame.view())?;
+        let targets_value = TensorRef::<i32>::from_array_view(([1usize, 1usize], &targets[..]))?;
+        let target_len_value = TensorRef::<i32>::from_array_view(([1usize], &target_len[..]))?;
+        let state_1_value = TensorRef::<f32>::from_array_view(state_1.view())?;
+        let state_2_value = TensorRef::<f32>::from_array_view(state_2.view())?;
 
         let outputs = self.decoder_joint.run(ort::inputs![
-            "encoder_outputs" => ort::value::Value::from_array(encoder_frame.clone())?,
-            "targets" => ort::value::Value::from_array(targets)?,
-            "target_length" => ort::value::Value::from_array(target_len)?,
-            "input_states_1" => ort::value::Value::from_array(state_1.clone())?,
-            "input_states_2" => ort::value::Value::from_array(state_2.clone())?
+            "encoder_outputs" => encoder_frame_value,
+            "targets" => targets_value,
+            "target_length" => target_len_value,
+            "input_states_1" => state_1_value,
+            "input_states_2" => state_2_value
         ])?;
 
         // logits for others I think you can understand by looking at the error msgs right?
@@ -400,40 +405,139 @@ impl NemotronModel {
     }
 }
 
-fn roll_projected_layer(cache: &mut Array4<f32>, layer: usize, current: &Array3<f32>) -> Result<()> {
+fn projected_layer_slice(cache: &Array4<f32>, layer: usize) -> Result<&[f32]> {
+    let shape = cache.shape();
+    if layer >= shape[0] {
+        return Err(Error::Model(format!("projected cache layer out of range: {layer}")));
+    }
+    let layer_values = shape[1] * shape[2] * shape[3];
+    let start = layer * layer_values;
+    let end = start + layer_values;
+    cache
+        .as_slice()
+        .and_then(|values| values.get(start..end))
+        .ok_or_else(|| Error::Model("projected cache is not contiguous".to_string()))
+}
+
+fn projected_layer_slice_mut(cache: &mut Array4<f32>, layer: usize) -> Result<&mut [f32]> {
     let cache_shape = cache.shape();
     if layer >= cache_shape[0] {
         return Err(Error::Model(format!("projected cache layer out of range: {layer}")));
     }
-    if current.shape().len() != 3 || current.shape()[0] != cache_shape[1] || current.shape()[2] != cache_shape[3] {
+    let layer_values = cache_shape[1] * cache_shape[2] * cache_shape[3];
+    let start = layer * layer_values;
+    let end = start + layer_values;
+    cache
+        .as_slice_mut()
+        .and_then(|values| values.get_mut(start..end))
+        .ok_or_else(|| Error::Model("projected cache is not contiguous".to_string()))
+}
+
+fn roll_projected_layer_from_slice(
+    cache: &mut Array4<f32>,
+    layer: usize,
+    current_shape: &[i64],
+    current: &[f32],
+) -> Result<()> {
+    let cache_shape = cache.shape();
+    if current_shape.len() != 3
+        || current_shape[0] as usize != cache_shape[1]
+        || current_shape[2] as usize != cache_shape[3]
+    {
         return Err(Error::Model(format!(
-            "projected cache shape mismatch: cache={cache_shape:?}, current={:?}",
-            current.shape()
+            "projected cache shape mismatch: cache={cache_shape:?}, current={current_shape:?}",
         )));
     }
 
     let batch = cache_shape[1];
     let cache_len = cache_shape[2];
     let hidden = cache_shape[3];
-    let current_frames = current.shape()[1].min(cache_len);
+    let current_frames = (current_shape[1] as usize).min(cache_len);
     if current_frames == 0 {
         return Ok(());
     }
+    let input_frames = current_shape[1] as usize;
+    let expected_values = batch * input_frames * hidden;
+    if current.len() != expected_values {
+        return Err(Error::Model(format!(
+            "projected cache data length mismatch: got {}, expected {}",
+            current.len(),
+            expected_values
+        )));
+    }
 
     let keep = cache_len - current_frames;
+    let layer_cache = projected_layer_slice_mut(cache, layer)?;
     for b in 0..batch {
-        for frame in 0..keep {
-            for h in 0..hidden {
-                let source = frame + current_frames;
-                cache[[layer, b, frame, h]] = cache[[layer, b, source, h]];
-            }
-        }
-        let current_start = current.shape()[1] - current_frames;
-        for frame in 0..current_frames {
-            for h in 0..hidden {
-                cache[[layer, b, keep + frame, h]] = current[[b, current_start + frame, h]];
-            }
+        let cache_batch_start = b * cache_len * hidden;
+        let cache_batch = &mut layer_cache[cache_batch_start..cache_batch_start + cache_len * hidden];
+        let input_batch_start = b * input_frames * hidden;
+        let input_batch = &current[input_batch_start..input_batch_start + input_frames * hidden];
+        if current_frames >= cache_len {
+            let input_start = (input_frames - cache_len) * hidden;
+            cache_batch.copy_from_slice(&input_batch[input_start..]);
+        } else {
+            cache_batch.copy_within(current_frames * hidden.., 0);
+            let input_start = (input_frames - current_frames) * hidden;
+            cache_batch[keep * hidden..].copy_from_slice(&input_batch[input_start..]);
         }
     }
+    Ok(())
+}
+
+fn copy_output_to_array4(
+    name: &str,
+    destination: &mut Array4<f32>,
+    shape: &[i64],
+    data: &[f32],
+) -> Result<()> {
+    let expected_shape = destination.shape();
+    if shape.len() != 4
+        || shape
+            .iter()
+            .map(|dim| *dim as usize)
+            .ne(expected_shape.iter().copied())
+    {
+        return Err(Error::Model(format!(
+            "Unexpected {name} shape: got {shape:?}, expected {expected_shape:?}"
+        )));
+    }
+    let destination = destination
+        .as_slice_mut()
+        .ok_or_else(|| Error::Model(format!("{name} is not contiguous")))?;
+    if destination.len() != data.len() {
+        return Err(Error::Model(format!(
+            "Unexpected {name} data length: got {}, expected {}",
+            data.len(),
+            destination.len()
+        )));
+    }
+    destination.copy_from_slice(data);
+    Ok(())
+}
+
+fn copy_output_to_array1_i64(
+    name: &str,
+    destination: &mut Array1<i64>,
+    shape: &[i64],
+    data: &[i64],
+) -> Result<()> {
+    if shape.len() != 1 || shape[0] as usize != destination.len() {
+        return Err(Error::Model(format!(
+            "Unexpected {name} shape: got {shape:?}, expected [{}]",
+            destination.len()
+        )));
+    }
+    let destination = destination
+        .as_slice_mut()
+        .ok_or_else(|| Error::Model(format!("{name} is not contiguous")))?;
+    if destination.len() != data.len() {
+        return Err(Error::Model(format!(
+            "Unexpected {name} data length: got {}, expected {}",
+            data.len(),
+            destination.len()
+        )));
+    }
+    destination.copy_from_slice(data);
     Ok(())
 }

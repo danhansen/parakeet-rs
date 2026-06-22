@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
-use ndarray::{s, Array2, Array3};
+use ndarray::{Array2, Array3};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -609,18 +609,17 @@ impl Nemotron {
 
             let chunk_length = PRE_ENCODE_CACHE + main_len;
 
-            let (encoded, enc_len, new_cache) = {
+            let (encoded, enc_len) = {
                 let mut model = self.model.lock().map_err(|e| {
                     Error::Model(format!("Failed to acquire model lock: {e}"))
                 })?;
-                model.run_encoder(
+                model.run_encoder_into(
                     &mel_chunk,
                     chunk_length as i64,
-                    &self.encoder_cache,
+                    &mut self.encoder_cache,
                     self.prompt_index,
                 )?
             };
-            self.encoder_cache = new_cache;
 
             let new_tokens = self.decode_chunk(&encoded, enc_len as usize)?;
             all_tokens.extend(new_tokens);
@@ -709,18 +708,17 @@ impl Nemotron {
         let mel_chunk = Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
             .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))?;
 
-        let (encoded, enc_len, new_cache) = {
+        let (encoded, enc_len) = {
             let mut model = self.model.lock().map_err(|e| {
                 Error::Model(format!("Failed to acquire model lock: {e}"))
             })?;
-            model.run_encoder(
+            model.run_encoder_into(
                 &mel_chunk,
                 expected_size as i64,
-                &self.encoder_cache,
+                &mut self.encoder_cache,
                 self.prompt_index,
             )?
         };
-        self.encoder_cache = new_cache;
 
         let tokens = self.decode_chunk(&encoded, enc_len as usize)?;
         self.accumulated_tokens.extend(&tokens);
@@ -753,6 +751,7 @@ impl Nemotron {
         let mut tokens = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
         let max_symbols_per_step = 10;
+        let mut frame = Array3::<f32>::zeros((1, hidden_dim, 1));
 
         // Lock the model once for the entire decode loop to minimise
         // lock acquire/release overhead (many decoder steps per chunk).
@@ -761,11 +760,9 @@ impl Nemotron {
         })?;
 
         for t in 0..enc_frames {
-            let frame = encoder_out.slice(s![0, .., t]).to_owned();
-            let frame = frame
-                .to_shape((1, hidden_dim, 1))
-                .map_err(|e| Error::Model(format!("Failed to reshape frame: {e}")))?
-                .to_owned();
+            for h in 0..hidden_dim {
+                frame[[0, h, 0]] = encoder_out[[0, h, t]];
+            }
 
             for _ in 0..max_symbols_per_step {
                 let (logits, new_state_1, new_state_2) = model.run_decoder(
