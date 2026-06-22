@@ -6,6 +6,12 @@ use ort::value::ValueType;
 use std::borrow::Cow;
 use std::path::Path;
 
+fn trace_load(message: impl AsRef<str>) {
+    if std::env::var_os("PARAKEET_LOAD_TRACE").is_some() {
+        eprintln!("[parakeet-load] {}", message.as_ref());
+    }
+}
+
 #[derive(Clone)]
 pub struct ProjectedKvCache {
     pub key: Array4<f32>,
@@ -13,8 +19,8 @@ pub struct ProjectedKvCache {
 }
 
 /// Encoder cache state for Nemotron streaming inference.
-/// Shapes are model-dependent (English 0.6B uses left_context=70,
-/// multilingual 3.5 uses left_context=56) so always construct via [`NemotronEncoderCache::with_dims`].
+/// Shapes are model/export-dependent, so always construct via
+/// [`NemotronEncoderCache::with_dims`].
 #[derive(Clone)]
 pub struct NemotronEncoderCache {
     pub cache_last_channel: Array4<f32>,
@@ -112,13 +118,16 @@ impl NemotronModel {
             )));
         }
 
+        trace_load(format!("loading encoder {}", encoder_path.display()));
         let builder = Session::builder()?;
         let mut builder = exec_config.apply_to_session_builder(builder)?;
         let encoder = builder.commit_from_file(&encoder_path)?;
 
+        trace_load(format!("loading decoder {}", decoder_path.display()));
         let builder = Session::builder()?;
         let mut builder = exec_config.apply_to_session_builder(builder)?;
         let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        trace_load("sessions loaded");
 
         let mut config = NemotronModelConfig {
             num_encoder_layers: 24,
@@ -159,6 +168,16 @@ impl NemotronModel {
                 _ => {}
             }
         }
+
+        trace_load(format!(
+            "config layers={} left_context={} hidden={} conv_context={} prompt={} projected={}",
+            config.num_encoder_layers,
+            config.left_context,
+            config.hidden_dim,
+            config.conv_context,
+            has_prompt,
+            has_projected_kv_cache
+        ));
 
         Ok(Self {
             encoder,
