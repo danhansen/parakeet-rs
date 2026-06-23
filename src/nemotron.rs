@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
-use ndarray::{Array2, Array3};
+use ndarray::{Array1, Array2, Array3};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -101,6 +101,33 @@ pub enum NemotronMode {
     /// Multilingual Nemotron 3.5 0.6B with `prompt_index` input,
     /// vocab ~13k, supports `target_lang` selection.
     Multilingual,
+}
+
+#[derive(Debug, Clone)]
+pub struct NemotronTopToken {
+    pub id: usize,
+    pub piece: String,
+    pub logit: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NemotronTokenDecision {
+    pub chunk_index: usize,
+    pub frame_index: usize,
+    pub symbol_index: usize,
+    pub input_token_id: i32,
+    pub token_id: usize,
+    pub piece: String,
+    pub logit: f32,
+    pub blank_logit: f32,
+    pub margin: f32,
+    pub top: Vec<NemotronTopToken>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NemotronChunkTrace {
+    pub text: String,
+    pub decisions: Vec<NemotronTokenDecision>,
 }
 
 /// Minimal SentencePiece vocabulary loader.
@@ -641,6 +668,18 @@ impl Nemotron {
     /// This buffers raw audio and computes mel spectrograms over the full buffer
     /// to avoid edge effects at chunk boundaries.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<String> {
+        Ok(self.transcribe_chunk_internal(audio_chunk, false)?.text)
+    }
+
+    pub fn transcribe_chunk_with_trace(&mut self, audio_chunk: &[f32]) -> Result<NemotronChunkTrace> {
+        self.transcribe_chunk_internal(audio_chunk, true)
+    }
+
+    fn transcribe_chunk_internal(
+        &mut self,
+        audio_chunk: &[f32],
+        trace_tokens: bool,
+    ) -> Result<NemotronChunkTrace> {
         // Append raw audio to buffer
         self.audio_buffer.extend_from_slice(audio_chunk);
 
@@ -649,7 +688,10 @@ impl Nemotron {
         // For center=true padding, we need at least win_length samples to get 1 frame
         let total_audio = self.audio_buffer.len();
         if total_audio < WIN_LENGTH {
-            return Ok(String::new());
+            return Ok(NemotronChunkTrace {
+                text: String::new(),
+                decisions: Vec::new(),
+            });
         }
 
         // Compute mel spectrogram over the ENTIRE audio buffer
@@ -663,7 +705,10 @@ impl Nemotron {
         // Check if we have enough NEW frames to process a chunk
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
         if available_new_frames < CHUNK_SIZE {
-            return Ok(String::new());
+            return Ok(NemotronChunkTrace {
+                text: String::new(),
+                decisions: Vec::new(),
+            });
         }
 
         // Build encoder input chunk
@@ -720,7 +765,9 @@ impl Nemotron {
             )?
         };
 
-        let tokens = self.decode_chunk(&encoded, enc_len as usize)?;
+        let chunk_index = self.chunk_idx;
+        let (tokens, decisions) =
+            self.decode_chunk_with_trace(&encoded, enc_len as usize, chunk_index, trace_tokens)?;
         self.accumulated_tokens.extend(&tokens);
 
         // Advance processed position
@@ -744,14 +791,33 @@ impl Nemotron {
                 result.push_str(&self.vocab.decode_single(t));
             }
         }
-        Ok(result)
+        Ok(NemotronChunkTrace {
+            text: result,
+            decisions,
+        })
     }
 
     fn decode_chunk(&mut self, encoder_out: &Array3<f32>, enc_frames: usize) -> Result<Vec<usize>> {
+        let (tokens, _) =
+            self.decode_chunk_with_trace(encoder_out, enc_frames, self.chunk_idx, false)?;
+        Ok(tokens)
+    }
+
+    fn decode_chunk_with_trace(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        enc_frames: usize,
+        chunk_index: usize,
+        trace_tokens: bool,
+    ) -> Result<(Vec<usize>, Vec<NemotronTokenDecision>)> {
         let mut tokens = Vec::new();
+        let mut decisions = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
         let max_symbols_per_step = 10;
         let mut frame = Array3::<f32>::zeros((1, hidden_dim, 1));
+        let vocab = Arc::clone(&self.vocab);
+        let vocab_size = self.vocab_size;
+        let blank_id = self.blank_id;
 
         // Lock the model once for the entire decode loop to minimise
         // lock acquire/release overhead (many decoder steps per chunk).
@@ -764,10 +830,11 @@ impl Nemotron {
                 frame[[0, h, 0]] = encoder_out[[0, h, t]];
             }
 
-            for _ in 0..max_symbols_per_step {
+            for symbol_index in 0..max_symbols_per_step {
+                let input_token_id = self.last_token;
                 let (logits, new_state_1, new_state_2) = model.run_decoder(
                     &frame,
-                    self.last_token,
+                    input_token_id,
                     &self.state_1,
                     &self.state_2,
                 )?;
@@ -785,6 +852,21 @@ impl Nemotron {
                     break;
                 }
 
+                if trace_tokens {
+                    let blank_logit = logits.get(blank_id).copied().unwrap_or(f32::NEG_INFINITY);
+                    decisions.push(NemotronTokenDecision {
+                        chunk_index,
+                        frame_index: t,
+                        symbol_index,
+                        input_token_id,
+                        token_id: max_idx,
+                        piece: token_piece(&vocab, vocab_size, blank_id, max_idx),
+                        logit: max_val,
+                        blank_logit,
+                        margin: max_val - blank_logit,
+                        top: top_tokens(&logits, &vocab, vocab_size, blank_id, 8),
+                    });
+                }
                 tokens.push(max_idx);
                 self.last_token = max_idx as i32;
                 self.state_1 = new_state_1;
@@ -792,7 +874,7 @@ impl Nemotron {
             }
         }
 
-        Ok(tokens)
+        Ok((tokens, decisions))
     }
 
     /// Compute log mel spectrogram WITHOUT normalization.
@@ -809,4 +891,39 @@ impl Nemotron {
 
         Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))
     }
+}
+
+fn token_piece(
+    vocab: &SentencePieceVocab,
+    vocab_size: usize,
+    blank_id: usize,
+    token_id: usize,
+) -> String {
+    if token_id == blank_id {
+        "<blank>".to_string()
+    } else if token_id < vocab_size {
+        vocab.decode_single(token_id)
+    } else {
+        format!("<out:{token_id}>")
+    }
+}
+
+fn top_tokens(
+    logits: &Array1<f32>,
+    vocab: &SentencePieceVocab,
+    vocab_size: usize,
+    blank_id: usize,
+    k: usize,
+) -> Vec<NemotronTopToken> {
+    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    pairs.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    pairs
+        .into_iter()
+        .take(k)
+        .map(|(id, logit)| NemotronTopToken {
+            id,
+            piece: token_piece(vocab, vocab_size, blank_id, id),
+            logit,
+        })
+        .collect()
 }
