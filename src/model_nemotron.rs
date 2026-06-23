@@ -1,14 +1,290 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array3, Array4};
-use ort::session::{Session, SessionInputValue};
+use ort::session::{InMemorySession, Session, SessionInputValue};
 use ort::value::{TensorRef, ValueType};
 use std::borrow::Cow;
-use std::path::Path;
+use std::fs;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 fn trace_load(message: impl AsRef<str>) {
     if std::env::var_os("PARAKEET_LOAD_TRACE").is_some() {
         eprintln!("[parakeet-load] {}", message.as_ref());
+    }
+}
+
+struct OptimizedModelCachePaths {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    external_data_source_path: Option<PathBuf>,
+    external_data_cache_path: Option<PathBuf>,
+}
+
+enum LoadedSession {
+    File(Session),
+    DirectOrt(InMemorySession<'static>),
+}
+
+impl Deref for LoadedSession {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            LoadedSession::File(session) => session,
+            LoadedSession::DirectOrt(session) => session,
+        }
+    }
+}
+
+impl DerefMut for LoadedSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            LoadedSession::File(session) => session,
+            LoadedSession::DirectOrt(session) => session,
+        }
+    }
+}
+
+fn model_component_path(model_dir: &Path, stem: &str) -> Result<PathBuf> {
+    let ort_path = model_dir.join(format!("{stem}.ort"));
+    if ort_path.exists() {
+        return Ok(ort_path);
+    }
+
+    let onnx_path = model_dir.join(format!("{stem}.onnx"));
+    if onnx_path.exists() {
+        return Ok(onnx_path);
+    }
+
+    Err(Error::Model(format!(
+        "Missing {stem}.ort or {stem}.onnx in {}",
+        model_dir.display()
+    )))
+}
+
+fn optimized_model_cache_paths(
+    exec_config: &ExecutionConfig,
+    component: &str,
+    source_path: &Path,
+) -> Result<Option<OptimizedModelCachePaths>> {
+    let Some(cache_dir) = exec_config.ort_optimized_model_cache_dir() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(cache_dir)?;
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_cache_path_component)
+        .unwrap_or_else(|| "model".to_string());
+    let key = optimized_model_cache_key(exec_config, component, source_path)?;
+    let source_file_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_cache_path_component)
+        .unwrap_or_else(|| "model.onnx".to_string());
+    let artifact_dir = cache_dir.join(format!("{component}.{stem}.{key}"));
+    fs::create_dir_all(&artifact_dir)?;
+
+    let external_data_file_name = format!("{source_file_name}.data");
+    let external_data_source_path = source_path.with_file_name(&external_data_file_name);
+    let (external_data_source_path, external_data_cache_path) =
+        if external_data_source_path.exists() {
+            (
+                Some(external_data_source_path),
+                Some(artifact_dir.join(&external_data_file_name)),
+            )
+        } else {
+            (None, None)
+        };
+
+    Ok(Some(OptimizedModelCachePaths {
+        final_path: artifact_dir.join(&source_file_name),
+        temp_path: artifact_dir.join(format!("{source_file_name}.tmp")),
+        external_data_source_path,
+        external_data_cache_path,
+    }))
+}
+
+fn optimized_model_cache_key(
+    exec_config: &ExecutionConfig,
+    component: &str,
+    source_path: &Path,
+) -> Result<String> {
+    let metadata = fs::metadata(source_path)?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    update_fnv1a(&mut hash, b"wordpipe-nemotron-ort-cache-v1");
+    update_fnv1a(&mut hash, component.as_bytes());
+    update_fnv1a(&mut hash, source_path.to_string_lossy().as_bytes());
+    update_fnv1a(&mut hash, metadata.len().to_string().as_bytes());
+    update_fnv1a(&mut hash, modified_ns.to_string().as_bytes());
+    update_fnv1a(
+        &mut hash,
+        format!("{:?}", exec_config.execution_provider).as_bytes(),
+    );
+    update_fnv1a(
+        &mut hash,
+        format!("{:?}", exec_config.graph_optimization).as_bytes(),
+    );
+    update_fnv1a(&mut hash, exec_config.intra_threads.to_string().as_bytes());
+    update_fnv1a(&mut hash, exec_config.inter_threads.to_string().as_bytes());
+    update_fnv1a(&mut hash, ort::info().as_bytes());
+    Ok(format!("{hash:016x}"))
+}
+
+fn update_fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn sanitize_cache_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn materialize_external_data(paths: &OptimizedModelCachePaths, component: &str) {
+    let (Some(source_path), Some(cache_path)) = (
+        paths.external_data_source_path.as_ref(),
+        paths.external_data_cache_path.as_ref(),
+    ) else {
+        return;
+    };
+
+    let _ = fs::remove_file(cache_path);
+    if let Err(link_err) = fs::hard_link(source_path, cache_path) {
+        if let Err(copy_err) = fs::copy(source_path, cache_path) {
+            trace_load(format!(
+                "optimized cache external data materialization failed {component} {} -> {}: hard_link={link_err}; copy={copy_err}",
+                source_path.display(),
+                cache_path.display()
+            ));
+        }
+    }
+}
+
+fn load_direct_ort_session(
+    exec_config: &ExecutionConfig,
+    source_path: &Path,
+    log_id: &str,
+) -> Result<LoadedSession> {
+    trace_load(format!("direct ORT format load {}", source_path.display()));
+    let bytes = fs::read(source_path)?.into_boxed_slice();
+    let bytes = Box::leak(bytes);
+    let builder = Session::builder()?;
+    let mut builder = exec_config.apply_to_session_builder_for_cached_model(builder)?;
+    builder = builder.with_log_id(log_id)?;
+    Ok(LoadedSession::DirectOrt(
+        builder.commit_from_memory_directly(bytes)?,
+    ))
+}
+
+fn load_session_with_optional_cache(
+    exec_config: &ExecutionConfig,
+    component: &str,
+    source_path: &Path,
+    log_id: &str,
+) -> Result<LoadedSession> {
+    if source_path.extension().and_then(|value| value.to_str()) == Some("ort") {
+        return load_direct_ort_session(exec_config, source_path, log_id);
+    }
+
+    fn build_session(
+        exec_config: &ExecutionConfig,
+        load_path: &Path,
+        log_id: &str,
+        use_cached_model: bool,
+        optimized_output_path: Option<&Path>,
+    ) -> Result<LoadedSession> {
+        let builder = Session::builder()?;
+        let mut builder = if use_cached_model {
+            exec_config.apply_to_session_builder_for_cached_model(builder)?
+        } else {
+            exec_config.apply_to_session_builder(builder)?
+        };
+        builder = builder.with_log_id(log_id)?;
+        if let Some(optimized_output_path) = optimized_output_path {
+            builder = builder.with_optimized_model_path(optimized_output_path)?;
+        }
+        Ok(LoadedSession::File(builder.commit_from_file(load_path)?))
+    }
+
+    let Some(paths) = optimized_model_cache_paths(exec_config, component, source_path)? else {
+        return build_session(exec_config, source_path, log_id, false, None);
+    };
+
+    if paths.final_path.exists() {
+        trace_load(format!(
+            "optimized cache hit {component} {}",
+            paths.final_path.display()
+        ));
+        match build_session(exec_config, &paths.final_path, log_id, true, None) {
+            Ok(session) => return Ok(session),
+            Err(err) => {
+                trace_load(format!(
+                    "optimized cache load failed {component} {}: {err}",
+                    paths.final_path.display()
+                ));
+                let _ = fs::remove_file(&paths.final_path);
+                let _ = fs::remove_file(&paths.temp_path);
+                if let Some(external_data_path) = paths.external_data_cache_path.as_ref() {
+                    let _ = fs::remove_file(external_data_path);
+                }
+            }
+        }
+    }
+
+    trace_load(format!(
+        "optimized cache miss {component} source={}",
+        source_path.display()
+    ));
+    let _ = fs::remove_file(&paths.temp_path);
+    match build_session(
+        exec_config,
+        source_path,
+        log_id,
+        false,
+        Some(&paths.temp_path),
+    ) {
+        Ok(session) => {
+            if paths.temp_path.exists() {
+                let _ = fs::remove_file(&paths.final_path);
+                materialize_external_data(&paths, component);
+                if let Err(err) = fs::rename(&paths.temp_path, &paths.final_path) {
+                    trace_load(format!(
+                        "optimized cache rename failed {component} {} -> {}: {err}",
+                        paths.temp_path.display(),
+                        paths.final_path.display()
+                    ));
+                    let _ = fs::remove_file(&paths.temp_path);
+                }
+            }
+            Ok(session)
+        }
+        Err(err) => {
+            trace_load(format!(
+                "optimized cache write load failed {component}; retrying without cache: {err}"
+            ));
+            let _ = fs::remove_file(&paths.temp_path);
+            build_session(exec_config, source_path, log_id, false, None)
+        }
     }
 }
 
@@ -67,8 +343,8 @@ impl NemotronEncoderCache {
 /// flips on automatically when the encoder graph exposes a `prompt_index` input
 /// (the multilingual variant).
 pub struct NemotronModel {
-    encoder: Session,
-    decoder_joint: Session,
+    encoder: LoadedSession,
+    decoder_joint: LoadedSession,
     pub config: NemotronModelConfig,
     pub has_prompt: bool,
     pub has_projected_kv_cache: bool,
@@ -103,31 +379,24 @@ impl NemotronModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        let encoder_path = model_dir.join("encoder.onnx");
-        let decoder_path = model_dir.join("decoder_joint.onnx");
-
-        if !encoder_path.exists() {
-            return Err(Error::Config(format!(
-                "Missing encoder.onnx in {}",
-                model_dir.display()
-            )));
-        }
-        if !decoder_path.exists() {
-            return Err(Error::Config(format!(
-                "Missing decoder_joint.onnx in {}",
-                model_dir.display()
-            )));
-        }
+        let encoder_path = model_component_path(model_dir, "encoder")?;
+        let decoder_path = model_component_path(model_dir, "decoder_joint")?;
 
         trace_load(format!("loading encoder {}", encoder_path.display()));
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
+        let encoder = load_session_with_optional_cache(
+            &exec_config,
+            "encoder",
+            &encoder_path,
+            "wordpipe-nemotron-encoder",
+        )?;
 
         trace_load(format!("loading decoder {}", decoder_path.display()));
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        let decoder_joint = load_session_with_optional_cache(
+            &exec_config,
+            "decoder",
+            &decoder_path,
+            "wordpipe-nemotron-decoder",
+        )?;
         trace_load("sessions loaded");
 
         let mut config = NemotronModelConfig {
