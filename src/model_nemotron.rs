@@ -72,6 +72,7 @@ pub struct NemotronModel {
     pub config: NemotronModelConfig,
     pub has_prompt: bool,
     pub has_projected_kv_cache: bool,
+    pub has_signal_length_input: bool,
 }
 
 /// cfg for Nemotron model dims.
@@ -143,10 +144,15 @@ impl NemotronModel {
 
         let mut has_prompt = false;
         let mut has_projected_kv_cache = false;
+        let mut has_signal_length_input = false;
         for outlet in encoder.inputs() {
             let name = outlet.name();
             if name == "prompt_index" {
                 has_prompt = true;
+                continue;
+            }
+            if name == "processed_signal_length" {
+                has_signal_length_input = true;
                 continue;
             }
             if name == "cache_key_layer_0" {
@@ -170,13 +176,14 @@ impl NemotronModel {
         }
 
         trace_load(format!(
-            "config layers={} left_context={} hidden={} conv_context={} prompt={} projected={}",
+            "config layers={} left_context={} hidden={} conv_context={} prompt={} projected={} length_input={}",
             config.num_encoder_layers,
             config.left_context,
             config.hidden_dim,
             config.conv_context,
             has_prompt,
-            has_projected_kv_cache
+            has_projected_kv_cache,
+            has_signal_length_input
         ));
 
         Ok(Self {
@@ -185,6 +192,7 @@ impl NemotronModel {
             config,
             has_prompt,
             has_projected_kv_cache,
+            has_signal_length_input,
         })
     }
 
@@ -212,9 +220,7 @@ impl NemotronModel {
         cache: &mut NemotronEncoderCache,
         prompt_index: Option<i64>,
     ) -> Result<(Array3<f32>, i64)> {
-        let length_arr = [length];
         let features_value = TensorRef::<f32>::from_array_view(features.view())?;
-        let length_value = TensorRef::<i64>::from_array_view(([1usize], &length_arr[..]))?;
         let cache_last_channel_value =
             TensorRef::<f32>::from_array_view(cache.cache_last_channel.view())?;
         let cache_last_time_value = TensorRef::<f32>::from_array_view(cache.cache_last_time.view())?;
@@ -223,11 +229,18 @@ impl NemotronModel {
 
         let mut inputs = ort::inputs![
             "processed_signal" => features_value,
-            "processed_signal_length" => length_value,
             "cache_last_channel" => cache_last_channel_value,
             "cache_last_time" => cache_last_time_value,
             "cache_last_channel_len" => cache_last_channel_len_value
         ];
+        let length_arr = [length];
+        if self.has_signal_length_input {
+            let length_value = TensorRef::<i64>::from_array_view(([1usize], &length_arr[..]))?;
+            inputs.push((
+                Cow::Borrowed("processed_signal_length"),
+                SessionInputValue::from(length_value),
+            ));
+        }
         let prompt_arr = prompt_index.map(|idx| [idx]);
         if let Some(prompt_arr) = prompt_arr.as_ref() {
             let prompt_value = TensorRef::<i64>::from_array_view(([1usize], &prompt_arr[..]))?;
