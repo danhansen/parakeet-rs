@@ -5,7 +5,6 @@ use ort::session::{InMemorySession, Session, SessionInputValue};
 use ort::value::{TensorRef, ValueType};
 use std::borrow::Cow;
 use std::fs;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -20,29 +19,69 @@ struct OptimizedModelCachePaths {
     temp_path: PathBuf,
     external_data_source_path: Option<PathBuf>,
     external_data_cache_path: Option<PathBuf>,
+    extra_external_data: Vec<(PathBuf, PathBuf)>,
 }
 
-enum LoadedSession {
-    File(Session),
-    DirectOrt(InMemorySession<'static>),
+struct ModelBytes {
+    data: Box<[u8]>,
+    #[cfg(test)]
+    probe: Option<std::sync::Arc<LifetimeProbe>>,
 }
 
-impl Deref for LoadedSession {
-    type Target = Session;
+impl ModelBytes {
+    fn new(data: Box<[u8]>) -> Self {
+        Self { data, #[cfg(test)] probe: None }
+    }
+}
 
-    fn deref(&self) -> &Self::Target {
-        match self {
-            LoadedSession::File(session) => session,
-            LoadedSession::DirectOrt(session) => session,
+#[cfg(test)]
+#[derive(Default)]
+struct LifetimeProbe {
+    freed: std::sync::atomic::AtomicUsize,
+    native_session_gone: std::sync::atomic::AtomicBool,
+    session: std::sync::Mutex<Option<std::sync::Weak<ort::session::SharedSessionInner>>>,
+}
+
+impl Drop for ModelBytes {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            use std::sync::atomic::Ordering;
+            let gone = probe.session.lock().unwrap().as_ref()
+                .is_none_or(|weak| weak.upgrade().is_none());
+            probe.native_session_gone.store(gone, Ordering::SeqCst);
+            probe.freed.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
 
-impl DerefMut for LoadedSession {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+self_cell::self_cell!(
+    struct DirectOrtSession {
+        owner: ModelBytes,
+        #[covariant]
+        dependent: InMemorySession,
+    }
+);
+
+enum LoadedSession {
+    File(Session),
+    DirectOrt(DirectOrtSession),
+}
+
+impl LoadedSession {
+    // Neither sessions nor ORT outputs may escape these owner-bound closures.
+    // All public inference results are copied into owned ndarrays before return.
+    fn with_session<R>(&self, f: impl FnOnce(&Session) -> R) -> R {
         match self {
-            LoadedSession::File(session) => session,
-            LoadedSession::DirectOrt(session) => session,
+            Self::File(session) => f(session),
+            Self::DirectOrt(cell) => f(cell.borrow_dependent()),
+        }
+    }
+
+    fn with_session_mut<R>(&mut self, f: impl FnOnce(&mut Session) -> R) -> R {
+        match self {
+            Self::File(session) => f(session),
+            Self::DirectOrt(cell) => cell.with_dependent_mut(|_, session| f(session)),
         }
     }
 }
@@ -64,6 +103,30 @@ fn model_component_path(model_dir: &Path, stem: &str) -> Result<PathBuf> {
     )))
 }
 
+fn external_weight_files(source_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = vec![source_path.with_file_name(format!("{}.data",
+        source_path.file_name().unwrap().to_string_lossy()))];
+    let config_path = source_path.with_file_name("config.json");
+    if config_path.exists() {
+        let payload: serde_json::Value = serde_json::from_slice(&fs::read(config_path)?)?;
+        if let Some(shared) = payload.get("shared_weight_files") {
+            let names = shared.as_array().ok_or_else(|| Error::Model("invalid shared weight manifest".into()))?;
+            for name in names {
+                let name = name.as_str().ok_or_else(|| Error::Model("invalid shared weight path".into()))?;
+                let path = Path::new(name);
+                if path.is_absolute() || path.components().any(|part|
+                    matches!(part, std::path::Component::ParentDir)) {
+                    return Err(Error::Model("unsafe shared weight path".into()));
+                }
+                files.push(source_path.parent().unwrap().join(path));
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files.into_iter().filter(|path| path.is_file()).collect())
+}
+
 fn optimized_model_cache_paths(
     exec_config: &ExecutionConfig,
     component: &str,
@@ -72,6 +135,10 @@ fn optimized_model_cache_paths(
     let Some(cache_dir) = exec_config.ort_optimized_model_cache_dir() else {
         return Ok(None);
     };
+    // An opaque session-builder callback cannot be safely fingerprinted.
+    if exec_config.configure.is_some() {
+        return Ok(None);
+    }
     fs::create_dir_all(cache_dir)?;
     let stem = source_path
         .file_stem()
@@ -99,11 +166,19 @@ fn optimized_model_cache_paths(
             (None, None)
         };
 
+    let extra_external_data = external_weight_files(source_path)?.into_iter()
+        .filter(|path| Some(path) != external_data_source_path.as_ref())
+        .map(|source| {
+            let relative = source.strip_prefix(source_path.parent().unwrap()).unwrap();
+            let target = artifact_dir.join(relative);
+            (source, target)
+        }).collect();
     Ok(Some(OptimizedModelCachePaths {
         final_path: artifact_dir.join(&source_file_name),
-        temp_path: artifact_dir.join(format!("{source_file_name}.tmp")),
+        temp_path: artifact_dir.join(format!("{source_file_name}.{}.tmp", std::process::id())),
         external_data_source_path,
         external_data_cache_path,
+        extra_external_data,
     }))
 }
 
@@ -121,7 +196,7 @@ fn optimized_model_cache_key(
         .unwrap_or(0);
 
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    update_fnv1a(&mut hash, b"wordpipe-nemotron-ort-cache-v1");
+    update_fnv1a(&mut hash, b"wordpipe-nemotron-ort-cache-v2");
     update_fnv1a(&mut hash, component.as_bytes());
     update_fnv1a(&mut hash, source_path.to_string_lossy().as_bytes());
     update_fnv1a(&mut hash, metadata.len().to_string().as_bytes());
@@ -136,6 +211,24 @@ fn optimized_model_cache_key(
     );
     update_fnv1a(&mut hash, exec_config.intra_threads.to_string().as_bytes());
     update_fnv1a(&mut hash, exec_config.inter_threads.to_string().as_bytes());
+    update_fnv1a(&mut hash, format!("{:?}", exec_config.dimension_overrides).as_bytes());
+    update_fnv1a(&mut hash, format!("{:?}:{}:{:?}", exec_config.memory_pattern,
+        exec_config.parallel_execution, exec_config.cpu_arena).as_bytes());
+    update_fnv1a(&mut hash, std::env::consts::ARCH.as_bytes());
+    update_fnv1a(&mut hash, std::env::consts::OS.as_bytes());
+    #[cfg(target_arch = "x86_64")]
+    update_fnv1a(&mut hash, format!("sse2={},avx={},avx2={},fma={},avx512f={}",
+        std::is_x86_feature_detected!("sse2"), std::is_x86_feature_detected!("avx"),
+        std::is_x86_feature_detected!("avx2"), std::is_x86_feature_detected!("fma"),
+        std::is_x86_feature_detected!("avx512f")).as_bytes());
+    let mut fingerprint_files = external_weight_files(source_path)?;
+    fingerprint_files.push(source_path.with_file_name("config.json"));
+    for path in fingerprint_files {
+        if let Ok(metadata) = fs::metadata(&path) {
+            update_fnv1a(&mut hash, metadata.len().to_string().as_bytes());
+            update_fnv1a(&mut hash, format!("{:?}", metadata.modified().ok()).as_bytes());
+        }
+    }
     update_fnv1a(&mut hash, ort::info().as_bytes());
     Ok(format!("{hash:016x}"))
 }
@@ -161,6 +254,14 @@ fn sanitize_cache_path_component(value: &str) -> String {
 }
 
 fn materialize_external_data(paths: &OptimizedModelCachePaths, component: &str) {
+    for (source_path, cache_path) in &paths.extra_external_data {
+        if let Some(parent) = cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if !cache_path.exists() && fs::hard_link(source_path, cache_path).is_err() {
+            let _ = fs::copy(source_path, cache_path);
+        }
+    }
     let (Some(source_path), Some(cache_path)) = (
         paths.external_data_source_path.as_ref(),
         paths.external_data_cache_path.as_ref(),
@@ -187,12 +288,12 @@ fn load_direct_ort_session(
 ) -> Result<LoadedSession> {
     trace_load(format!("direct ORT format load {}", source_path.display()));
     let bytes = fs::read(source_path)?.into_boxed_slice();
-    let bytes = Box::leak(bytes);
     let builder = Session::builder()?;
     let mut builder = exec_config.apply_to_session_builder_for_cached_model(builder)?;
     builder = builder.with_log_id(log_id)?;
     Ok(LoadedSession::DirectOrt(
-        builder.commit_from_memory_directly(bytes)?,
+        DirectOrtSession::try_new(ModelBytes::new(bytes),
+            |bytes| builder.commit_from_memory_directly(&bytes.data))?,
     ))
 }
 
@@ -222,6 +323,11 @@ fn load_session_with_optional_cache(
         builder = builder.with_log_id(log_id)?;
         if let Some(optimized_output_path) = optimized_output_path {
             builder = builder.with_optimized_model_path(optimized_output_path)?;
+            let filename = format!("{}.data",
+                optimized_output_path.file_name().unwrap().to_string_lossy());
+            builder = builder
+                .with_config_entry("session.optimized_model_external_initializers_file_name", filename)?
+                .with_config_entry("session.optimized_model_external_initializers_min_size_in_bytes", "65536")?;
         }
         Ok(LoadedSession::File(builder.commit_from_file(load_path)?))
     }
@@ -265,7 +371,6 @@ fn load_session_with_optional_cache(
     ) {
         Ok(session) => {
             if paths.temp_path.exists() {
-                let _ = fs::remove_file(&paths.final_path);
                 materialize_external_data(&paths, component);
                 if let Err(err) = fs::rename(&paths.temp_path, &paths.final_path) {
                     trace_load(format!(
@@ -354,6 +459,7 @@ pub struct NemotronModel {
 /// cfg for Nemotron model dims.
 #[derive(Debug, Clone)]
 pub struct NemotronModelConfig {
+    pub chunk_size_output_frames: usize,
     pub num_encoder_layers: usize,
     pub hidden_dim: usize,
     pub left_context: usize,
@@ -378,6 +484,21 @@ impl NemotronModel {
         vocab_size: usize,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
+        let mut exec_config = exec_config;
+        // Mode is fixed for this session. New exports use distinct symbolic
+        // input/output names so ORT can specialize safely at session creation.
+        if model_dir.join("config.json").exists() {
+            let payload: serde_json::Value = serde_json::from_slice(
+                &fs::read(model_dir.join("config.json"))?)?;
+            let right = payload.get("right_context").and_then(|v| v.as_u64()).unwrap_or(6);
+            if !matches!(right, 6 | 13) {
+                return Err(Error::Model("Supported streaming modes are 560 and 1120 ms".into()));
+            }
+            exec_config = exec_config.with_dimension_override("batch", 1)
+                .with_dimension_override("mel_frames", ((right + 1) * 8 + 9) as i64)
+                .with_dimension_override("encoder_frames", (right + 1) as i64)
+                .with_dimension_override("current_frames", (right + 1) as i64);
+        }
 
         let encoder_path = model_component_path(model_dir, "encoder")?;
         let decoder_path = model_component_path(model_dir, "decoder_joint")?;
@@ -409,12 +530,31 @@ impl NemotronModel {
             vocab_size,
             blank_id: vocab_size,
             has_projected_kv_cache: false,
+            chunk_size_output_frames: 7,
         };
+
+        if let Some(frames) = encoder.with_session(|session| {
+            session.metadata().ok().and_then(|meta| meta.custom("chunk_size_output_frames"))
+                .and_then(|value| value.parse::<usize>().ok())
+        }) {
+            config.chunk_size_output_frames = frames;
+        }
+        let sidecar = model_dir.join("config.json");
+        if sidecar.exists() {
+            let payload: serde_json::Value = serde_json::from_slice(&fs::read(sidecar)?)?;
+            if let Some(right) = payload.get("right_context").and_then(|v| v.as_u64()) {
+                config.chunk_size_output_frames = right as usize + 1;
+            }
+        }
+        if !matches!(config.chunk_size_output_frames, 7 | 14) {
+            return Err(Error::Model("Supported streaming modes are 560 and 1120 ms".into()));
+        }
 
         let mut has_prompt = false;
         let mut has_projected_kv_cache = false;
         let mut has_signal_length_input = false;
-        for outlet in encoder.inputs() {
+        encoder.with_session(|session| {
+        for outlet in session.inputs() {
             let name = outlet.name();
             if name == "prompt_index" {
                 has_prompt = true;
@@ -432,6 +572,15 @@ impl NemotronModel {
             let ValueType::Tensor { shape, .. } = outlet.dtype() else { continue };
             let dims: &[i64] = shape;
             match name {
+                "processed_signal" if dims.len() == 3 && dims[2] > 0 => {
+                    let expected = (config.chunk_size_output_frames * 8 + 9) as i64;
+                    if dims[2] != expected {
+                        return Err(Error::Model(format!(
+                            "encoder input has {} mel frames, but mode requires {expected}",
+                            dims[2]
+                        )));
+                    }
+                }
                 "cache_last_channel" if dims.len() == 4 => {
                     config.num_encoder_layers = dims[0] as usize;
                     config.left_context = dims[2] as usize;
@@ -454,6 +603,8 @@ impl NemotronModel {
             has_projected_kv_cache,
             has_signal_length_input
         ));
+        Ok(())
+        })?;
 
         Ok(Self {
             encoder,
@@ -489,6 +640,7 @@ impl NemotronModel {
         cache: &mut NemotronEncoderCache,
         prompt_index: Option<i64>,
     ) -> Result<(Array3<f32>, i64)> {
+        self.encoder.with_session_mut(|session| {
         let features_value = TensorRef::<f32>::from_array_view(features.view())?;
         let cache_last_channel_value =
             TensorRef::<f32>::from_array_view(cache.cache_last_channel.view())?;
@@ -544,7 +696,7 @@ impl NemotronModel {
             }
         }
 
-        let outputs = self.encoder.run(inputs)?;
+        let outputs = session.run(inputs)?;
 
         // [1, hidden_dim, time]
         let (shape, data) = outputs["encoded"]
@@ -621,6 +773,7 @@ impl NemotronModel {
         )?;
 
         Ok((encoder_out, encoded_len))
+        })
     }
 
     /// Run decoder step.
@@ -640,7 +793,8 @@ impl NemotronModel {
         let state_1_value = TensorRef::<f32>::from_array_view(state_1.view())?;
         let state_2_value = TensorRef::<f32>::from_array_view(state_2.view())?;
 
-        let outputs = self.decoder_joint.run(ort::inputs![
+        self.decoder_joint.with_session_mut(|session| {
+        let outputs = session.run(ort::inputs![
             "encoder_outputs" => encoder_frame_value,
             "targets" => targets_value,
             "target_length" => target_len_value,
@@ -684,6 +838,7 @@ impl NemotronModel {
         .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
 
         Ok((logits, new_state_1, new_state_2))
+        })
     }
 }
 
@@ -796,6 +951,87 @@ fn copy_output_to_array4(
     }
     destination.copy_from_slice(data);
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_lifetime_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn backing_bytes_are_freed_when_session_creation_fails() {
+        let probe = Arc::new(LifetimeProbe::default());
+        let owner = ModelBytes { data: vec![0_u8; 8].into_boxed_slice(), probe: Some(probe.clone()) };
+        let result = DirectOrtSession::try_new(owner, |_| Err::<InMemorySession<'_>, _>("failure"));
+        assert!(result.is_err());
+        assert_eq!(probe.freed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn direct_ort_session_drops_before_its_backing_bytes() {
+        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else { return; };
+        let path = PathBuf::from(directory).join("session.ort");
+        for _ in 0..3 {
+            let probe = Arc::new(LifetimeProbe::default());
+            let owner = ModelBytes {
+                data: fs::read(&path).unwrap().into_boxed_slice(),
+                probe: Some(probe.clone()),
+            };
+            let mut builder = Session::builder().unwrap();
+            let mut cell = DirectOrtSession::try_new(owner,
+                |bytes| builder.commit_from_memory_directly(&bytes.data)).unwrap();
+            cell.with_dependent_mut(|_, session| {
+                *probe.session.lock().unwrap() = Some(Arc::downgrade(&session.inner()));
+                let data = Array3::<f32>::zeros((1, 128, 65));
+                let outputs = session.run(ort::inputs![
+                    "audio" => TensorRef::from_array_view(data.view()).unwrap()
+                ]).unwrap();
+                let (_, shape) = outputs["shape"].try_extract_tensor::<i64>().unwrap();
+                assert_eq!(shape, &[1, 128, 65]);
+            });
+            assert_eq!(probe.freed.load(Ordering::SeqCst), 0);
+            drop(cell);
+            assert_eq!(probe.freed.load(Ordering::SeqCst), 1);
+            assert!(probe.native_session_gone.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn optimized_cache_separates_dimensions_and_reuses_each_mode() {
+        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else { return; };
+        let source = PathBuf::from(directory).join("source.onnx");
+        let cache = std::env::temp_dir().join(format!("wordpipe-cache-test-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut previous = None;
+        for frames in [65_i64, 121, 65] {
+            let config = ExecutionConfig::default()
+                .with_ort_optimized_model_cache_dir(&cache)
+                .with_dimension_override("frames", frames);
+            let paths = optimized_model_cache_paths(&config, "encoder", &source).unwrap().unwrap();
+            let mut session = load_session_with_optional_cache(
+                &config, "encoder", &source, "shape-test").unwrap();
+            session.with_session_mut(|session| {
+                let data = Array3::<f32>::zeros((1, 128, frames as usize));
+                let outputs = session.run(ort::inputs![
+                    "audio" => TensorRef::from_array_view(data.view()).unwrap()
+                ]).unwrap();
+                let (_, shape) = outputs["shape"].try_extract_tensor::<i64>().unwrap();
+                assert_eq!(shape, &[1, 128, frames]);
+            });
+            assert!(paths.final_path.is_file());
+            if frames == 65 {
+                if let Some(previous) = &previous {
+                    assert_eq!(previous, &paths.final_path);
+                } else {
+                    previous = Some(paths.final_path);
+                }
+            } else {
+                assert_ne!(previous.as_ref().unwrap(), &paths.final_path);
+            }
+        }
+        fs::remove_dir_all(cache).unwrap();
+    }
 }
 
 fn copy_output_to_array1_i64(

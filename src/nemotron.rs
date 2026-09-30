@@ -20,9 +20,7 @@ const N_MELS: usize = 128;
 const PREEMPH: f32 = 0.97;
 const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
 
-// Streaming chunk config (identical across English-only and multilingual variants:
-// both use chunk_size_output=7 in NeMo's streaming_cfg which corresponds to 56 mel frames).
-const CHUNK_SIZE: usize = 56;
+// Chunk size is derived from the model's output-frame metadata when loaded.
 const PRE_ENCODE_CACHE: usize = 9;
 
 /// Language → prompt embedding index for the multilingual model. Mirrors
@@ -311,6 +309,7 @@ pub struct NemotronHandle {
     vocab_size: usize,
     blank_id: usize,
     has_projected_kv_cache: bool,
+    chunk_size: usize,
     /// Empty for en. populated for multilingual with all `<xx-XX>` token ids.
     lang_tag_ids: Arc<Vec<usize>>,
 }
@@ -347,6 +346,7 @@ pub struct Nemotron {
     audio_buffer: Vec<f32>,
     /// How many audio samples have been processed (converted to mel and sent to encoder)
     audio_processed: usize,
+    chunk_size: usize,
     chunk_idx: usize,
     accumulated_tokens: Vec<usize>,
 }
@@ -401,6 +401,7 @@ impl NemotronHandle {
             vocab_size: cfg.vocab_size,
             blank_id: cfg.blank_id,
             has_projected_kv_cache: cfg.has_projected_kv_cache,
+            chunk_size: cfg.chunk_size_output_frames * 8,
             lang_tag_ids: Arc::new(lang_tag_ids),
         })
     }
@@ -485,6 +486,7 @@ impl Nemotron {
             prompt_index,
             audio_buffer: Vec::new(),
             audio_processed: 0,
+            chunk_size: handle.chunk_size,
             chunk_idx: 0,
             accumulated_tokens: Vec::new(),
         }
@@ -608,10 +610,10 @@ impl Nemotron {
         let mut chunk_idx = 0;
 
         while buffer_idx < total_frames {
-            let chunk_end = (buffer_idx + CHUNK_SIZE).min(total_frames);
+            let chunk_end = (buffer_idx + self.chunk_size).min(total_frames);
             let main_len = chunk_end - buffer_idx;
 
-            let expected_size = PRE_ENCODE_CACHE + CHUNK_SIZE;
+            let expected_size = PRE_ENCODE_CACHE + self.chunk_size;
             let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
 
             // Fill pre-encode cache from previous frames
@@ -651,7 +653,7 @@ impl Nemotron {
             let new_tokens = self.decode_chunk(&encoded, enc_len as usize)?;
             all_tokens.extend(new_tokens);
 
-            buffer_idx += CHUNK_SIZE;
+            buffer_idx += self.chunk_size;
             chunk_idx += 1;
         }
 
@@ -661,6 +663,11 @@ impl Nemotron {
             .collect();
 
         Ok(self.vocab.decode(&valid_tokens))
+    }
+
+    /// Required number of 16 kHz audio samples per streaming chunk.
+    pub fn chunk_samples(&self) -> usize {
+        self.chunk_size * HOP_LENGTH
     }
 
     /// Stream transcribe a chunk of audio (call repeatedly for real-time).
@@ -704,7 +711,7 @@ impl Nemotron {
 
         // Check if we have enough NEW frames to process a chunk
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
-        if available_new_frames < CHUNK_SIZE {
+        if available_new_frames < self.chunk_size {
             return Ok(NemotronChunkTrace {
                 text: String::new(),
                 decisions: Vec::new(),
@@ -712,17 +719,17 @@ impl Nemotron {
         }
 
         // Build encoder input chunk
-        let expected_size = PRE_ENCODE_CACHE + CHUNK_SIZE;
+        let expected_size = PRE_ENCODE_CACHE + self.chunk_size;
         let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
 
         // Determine the mel frame range for this chunk
         let is_first_chunk = self.chunk_idx == 0;
         let main_start = processed_mel_frames;
-        let _main_end = main_start + CHUNK_SIZE;
+        let _main_end = main_start + self.chunk_size;
 
         if is_first_chunk {
             // First chunk: zero-pad for pre-encode cache
-            for f in 0..CHUNK_SIZE.min(total_mel_frames) {
+            for f in 0..self.chunk_size.min(total_mel_frames) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] = full_mel[[m, f]];
                 }
@@ -742,7 +749,7 @@ impl Nemotron {
             }
 
             // Fill main chunk
-            for f in 0..CHUNK_SIZE.min(total_mel_frames - main_start) {
+            for f in 0..self.chunk_size.min(total_mel_frames - main_start) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] =
                         full_mel[[m, main_start + f]];
@@ -771,12 +778,12 @@ impl Nemotron {
         self.accumulated_tokens.extend(&tokens);
 
         // Advance processed position
-        self.audio_processed += CHUNK_SIZE * HOP_LENGTH;
+        self.audio_processed += self.chunk_size * HOP_LENGTH;
         self.chunk_idx += 1;
 
         // Trim audio buffer to keep memory bounded
         // Keep enough for pre-encode cache context
-        let keep_samples = (PRE_ENCODE_CACHE + CHUNK_SIZE) * HOP_LENGTH + WIN_LENGTH;
+        let keep_samples = (PRE_ENCODE_CACHE + self.chunk_size) * HOP_LENGTH + WIN_LENGTH;
         if self.audio_buffer.len() > keep_samples * 2 {
             let remove = self.audio_buffer.len() - keep_samples;
             // Adjust processed counter since we're removing from the start

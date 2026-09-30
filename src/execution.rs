@@ -47,6 +47,7 @@ pub enum GraphOptimization {
 
 #[derive(Clone)]
 pub struct ModelConfig {
+    pub dimension_overrides: std::collections::BTreeMap<String, i64>,
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
@@ -95,6 +96,7 @@ impl fmt::Debug for ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            dimension_overrides: Default::default(),
             execution_provider: ExecutionProvider::default(),
             intra_threads: 4,
             inter_threads: 1,
@@ -151,6 +153,11 @@ impl ModelConfig {
 
     pub fn with_ort_optimized_model_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.ort_optimized_model_cache_dir = Some(path.into());
+        self
+    }
+
+    pub fn with_dimension_override(mut self, name: impl Into<String>, size: i64) -> Self {
+        self.dimension_overrides.insert(name.into(), size);
         self
     }
 
@@ -216,6 +223,9 @@ impl ModelConfig {
             .with_optimization_level(graph_optimization)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
+        for (name, size) in &self.dimension_overrides {
+            builder = builder.with_dimension_override(name, *size)?;
+        }
 
         if let Some(memory_pattern) = self.memory_pattern {
             builder = builder.with_memory_pattern(memory_pattern)?;
