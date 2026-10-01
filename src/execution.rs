@@ -47,6 +47,9 @@ pub enum GraphOptimization {
 
 #[derive(Clone)]
 pub struct ModelConfig {
+    /// Select a supported streaming context when loading a generic encoder.
+    /// Fixed exports only accept their existing context.
+    pub streaming_chunk_frames: Option<usize>,
     pub dimension_overrides: std::collections::BTreeMap<String, i64>,
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
@@ -76,6 +79,7 @@ impl fmt::Debug for ModelConfig {
             .field("memory_pattern", &self.memory_pattern)
             .field("parallel_execution", &self.parallel_execution)
             .field("cpu_arena", &self.cpu_arena)
+            .field("streaming_chunk_frames", &self.streaming_chunk_frames)
             .field(
                 "ort_optimized_model_cache_dir",
                 &self.ort_optimized_model_cache_dir,
@@ -96,6 +100,7 @@ impl fmt::Debug for ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            streaming_chunk_frames: None,
             dimension_overrides: Default::default(),
             execution_provider: ExecutionProvider::default(),
             intra_threads: 4,
@@ -158,6 +163,11 @@ impl ModelConfig {
 
     pub fn with_dimension_override(mut self, name: impl Into<String>, size: i64) -> Self {
         self.dimension_overrides.insert(name.into(), size);
+        self
+    }
+
+    pub fn with_streaming_chunk_frames(mut self, frames: usize) -> Self {
+        self.streaming_chunk_frames = Some(frames);
         self
     }
 
@@ -237,11 +247,9 @@ impl ModelConfig {
         builder = match self.execution_provider {
             ExecutionProvider::Cpu => {
                 if let Some(cpu_arena) = self.cpu_arena {
-                    builder.with_execution_providers([
-                        ort::ep::CPU::default()
-                            .with_arena_allocator(cpu_arena)
-                            .build(),
-                    ])?
+                    builder.with_execution_providers([ort::ep::CPU::default()
+                        .with_arena_allocator(cpu_arena)
+                        .build()])?
                 } else {
                     builder
                 }

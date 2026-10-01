@@ -30,7 +30,11 @@ struct ModelBytes {
 
 impl ModelBytes {
     fn new(data: Box<[u8]>) -> Self {
-        Self { data, #[cfg(test)] probe: None }
+        Self {
+            data,
+            #[cfg(test)]
+            probe: None,
+        }
     }
 }
 
@@ -47,7 +51,11 @@ impl Drop for ModelBytes {
         #[cfg(test)]
         if let Some(probe) = &self.probe {
             use std::sync::atomic::Ordering;
-            let gone = probe.session.lock().unwrap().as_ref()
+            let gone = probe
+                .session
+                .lock()
+                .unwrap()
+                .as_ref()
                 .is_none_or(|weak| weak.upgrade().is_none());
             probe.native_session_gone.store(gone, Ordering::SeqCst);
             probe.freed.fetch_add(1, Ordering::SeqCst);
@@ -104,18 +112,27 @@ fn model_component_path(model_dir: &Path, stem: &str) -> Result<PathBuf> {
 }
 
 fn external_weight_files(source_path: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = vec![source_path.with_file_name(format!("{}.data",
-        source_path.file_name().unwrap().to_string_lossy()))];
+    let mut files = vec![source_path.with_file_name(format!(
+        "{}.data",
+        source_path.file_name().unwrap().to_string_lossy()
+    ))];
     let config_path = source_path.with_file_name("config.json");
     if config_path.exists() {
         let payload: serde_json::Value = serde_json::from_slice(&fs::read(config_path)?)?;
         if let Some(shared) = payload.get("shared_weight_files") {
-            let names = shared.as_array().ok_or_else(|| Error::Model("invalid shared weight manifest".into()))?;
+            let names = shared
+                .as_array()
+                .ok_or_else(|| Error::Model("invalid shared weight manifest".into()))?;
             for name in names {
-                let name = name.as_str().ok_or_else(|| Error::Model("invalid shared weight path".into()))?;
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| Error::Model("invalid shared weight path".into()))?;
                 let path = Path::new(name);
-                if path.is_absolute() || path.components().any(|part|
-                    matches!(part, std::path::Component::ParentDir)) {
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
                     return Err(Error::Model("unsafe shared weight path".into()));
                 }
                 files.push(source_path.parent().unwrap().join(path));
@@ -166,13 +183,15 @@ fn optimized_model_cache_paths(
             (None, None)
         };
 
-    let extra_external_data = external_weight_files(source_path)?.into_iter()
+    let extra_external_data = external_weight_files(source_path)?
+        .into_iter()
         .filter(|path| Some(path) != external_data_source_path.as_ref())
         .map(|source| {
             let relative = source.strip_prefix(source_path.parent().unwrap()).unwrap();
             let target = artifact_dir.join(relative);
             (source, target)
-        }).collect();
+        })
+        .collect();
     Ok(Some(OptimizedModelCachePaths {
         final_path: artifact_dir.join(&source_file_name),
         temp_path: artifact_dir.join(format!("{source_file_name}.{}.tmp", std::process::id())),
@@ -211,22 +230,42 @@ fn optimized_model_cache_key(
     );
     update_fnv1a(&mut hash, exec_config.intra_threads.to_string().as_bytes());
     update_fnv1a(&mut hash, exec_config.inter_threads.to_string().as_bytes());
-    update_fnv1a(&mut hash, format!("{:?}", exec_config.dimension_overrides).as_bytes());
-    update_fnv1a(&mut hash, format!("{:?}:{}:{:?}", exec_config.memory_pattern,
-        exec_config.parallel_execution, exec_config.cpu_arena).as_bytes());
+    update_fnv1a(
+        &mut hash,
+        format!("{:?}", exec_config.dimension_overrides).as_bytes(),
+    );
+    update_fnv1a(
+        &mut hash,
+        format!(
+            "{:?}:{}:{:?}",
+            exec_config.memory_pattern, exec_config.parallel_execution, exec_config.cpu_arena
+        )
+        .as_bytes(),
+    );
     update_fnv1a(&mut hash, std::env::consts::ARCH.as_bytes());
     update_fnv1a(&mut hash, std::env::consts::OS.as_bytes());
     #[cfg(target_arch = "x86_64")]
-    update_fnv1a(&mut hash, format!("sse2={},avx={},avx2={},fma={},avx512f={}",
-        std::is_x86_feature_detected!("sse2"), std::is_x86_feature_detected!("avx"),
-        std::is_x86_feature_detected!("avx2"), std::is_x86_feature_detected!("fma"),
-        std::is_x86_feature_detected!("avx512f")).as_bytes());
+    update_fnv1a(
+        &mut hash,
+        format!(
+            "sse2={},avx={},avx2={},fma={},avx512f={}",
+            std::is_x86_feature_detected!("sse2"),
+            std::is_x86_feature_detected!("avx"),
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("fma"),
+            std::is_x86_feature_detected!("avx512f")
+        )
+        .as_bytes(),
+    );
     let mut fingerprint_files = external_weight_files(source_path)?;
     fingerprint_files.push(source_path.with_file_name("config.json"));
     for path in fingerprint_files {
         if let Ok(metadata) = fs::metadata(&path) {
             update_fnv1a(&mut hash, metadata.len().to_string().as_bytes());
-            update_fnv1a(&mut hash, format!("{:?}", metadata.modified().ok()).as_bytes());
+            update_fnv1a(
+                &mut hash,
+                format!("{:?}", metadata.modified().ok()).as_bytes(),
+            );
         }
     }
     update_fnv1a(&mut hash, ort::info().as_bytes());
@@ -291,10 +330,10 @@ fn load_direct_ort_session(
     let builder = Session::builder()?;
     let mut builder = exec_config.apply_to_session_builder_for_cached_model(builder)?;
     builder = builder.with_log_id(log_id)?;
-    Ok(LoadedSession::DirectOrt(
-        DirectOrtSession::try_new(ModelBytes::new(bytes),
-            |bytes| builder.commit_from_memory_directly(&bytes.data))?,
-    ))
+    Ok(LoadedSession::DirectOrt(DirectOrtSession::try_new(
+        ModelBytes::new(bytes),
+        |bytes| builder.commit_from_memory_directly(&bytes.data),
+    )?))
 }
 
 fn load_session_with_optional_cache(
@@ -323,11 +362,19 @@ fn load_session_with_optional_cache(
         builder = builder.with_log_id(log_id)?;
         if let Some(optimized_output_path) = optimized_output_path {
             builder = builder.with_optimized_model_path(optimized_output_path)?;
-            let filename = format!("{}.data",
-                optimized_output_path.file_name().unwrap().to_string_lossy());
+            let filename = format!(
+                "{}.data",
+                optimized_output_path.file_name().unwrap().to_string_lossy()
+            );
             builder = builder
-                .with_config_entry("session.optimized_model_external_initializers_file_name", filename)?
-                .with_config_entry("session.optimized_model_external_initializers_min_size_in_bytes", "65536")?;
+                .with_config_entry(
+                    "session.optimized_model_external_initializers_file_name",
+                    filename,
+                )?
+                .with_config_entry(
+                    "session.optimized_model_external_initializers_min_size_in_bytes",
+                    "65536",
+                )?;
         }
         Ok(LoadedSession::File(builder.commit_from_file(load_path)?))
     }
@@ -443,6 +490,57 @@ impl NemotronEncoderCache {
     }
 }
 
+fn streaming_frames_from_config(
+    payload: &serde_json::Value,
+    requested: Option<usize>,
+) -> Result<usize> {
+    let default_frames = payload
+        .get("right_context")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(6) as usize
+        + 1;
+    let frames = requested.unwrap_or(default_frames);
+    if frames == 0 || default_frames == 0 {
+        return Err(Error::Model("streaming chunk frames must be positive".into()));
+    }
+    if let Some(dynamic) = payload
+        .get("dynamic_streaming")
+        .filter(|value| !value.is_null())
+    {
+        let valid = dynamic.get("format").and_then(|value| value.as_u64()) == Some(1)
+            && dynamic
+                .get("shape_derived_attention_context")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            && dynamic
+                .get("subsampling_factor")
+                .and_then(|value| value.as_u64())
+                == Some(8)
+            && dynamic
+                .get("mel_frames_overhead")
+                .and_then(|value| value.as_u64())
+                == Some(9)
+            && dynamic
+                .get("supported_chunk_frames")
+                .and_then(|value| value.as_array())
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.as_u64() == Some(frames as u64))
+                });
+        if !valid {
+            return Err(Error::Model(
+                "invalid or unsupported dynamic streaming contract".into(),
+            ));
+        }
+    } else if frames != default_frames {
+        return Err(Error::Model(
+            "fixed encoder cannot change attention context; install a dynamic export".into(),
+        ));
+    }
+    Ok(frames)
+}
+
 /// Nemotron ONNX wrapper.
 /// Encoder and decoder_joint sessions live side by side; [`Self::has_prompt`]
 /// flips on automatically when the encoder graph exposes a `prompt_index` input
@@ -485,20 +583,25 @@ impl NemotronModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let mut exec_config = exec_config;
-        // Mode is fixed for this session. New exports use distinct symbolic
-        // input/output names so ORT can specialize safely at session creation.
-        if model_dir.join("config.json").exists() {
-            let payload: serde_json::Value = serde_json::from_slice(
-                &fs::read(model_dir.join("config.json"))?)?;
-            let right = payload.get("right_context").and_then(|v| v.as_u64()).unwrap_or(6);
-            if !matches!(right, 6 | 13) {
-                return Err(Error::Model("Supported streaming modes are 560 and 1120 ms".into()));
+        let sidecar = model_dir.join("config.json");
+        let selected_frames = if sidecar.exists() {
+            let payload: serde_json::Value = serde_json::from_slice(&fs::read(&sidecar)?)?;
+            let frames =
+                streaming_frames_from_config(&payload, exec_config.streaming_chunk_frames)?;
+            exec_config = exec_config
+                .with_dimension_override("batch", 1)
+                .with_dimension_override("mel_frames", (frames * 8 + 9) as i64)
+                .with_dimension_override("encoder_frames", frames as i64)
+                .with_dimension_override("current_frames", frames as i64);
+            Some(frames)
+        } else {
+            if exec_config.streaming_chunk_frames.is_some() {
+                return Err(Error::Model(
+                    "explicit streaming context requires config.json".into(),
+                ));
             }
-            exec_config = exec_config.with_dimension_override("batch", 1)
-                .with_dimension_override("mel_frames", ((right + 1) * 8 + 9) as i64)
-                .with_dimension_override("encoder_frames", (right + 1) as i64)
-                .with_dimension_override("current_frames", (right + 1) as i64);
-        }
+            None
+        };
 
         let encoder_path = model_component_path(model_dir, "encoder")?;
         let decoder_path = model_component_path(model_dir, "decoder_joint")?;
@@ -534,20 +637,21 @@ impl NemotronModel {
         };
 
         if let Some(frames) = encoder.with_session(|session| {
-            session.metadata().ok().and_then(|meta| meta.custom("chunk_size_output_frames"))
+            session
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.custom("chunk_size_output_frames"))
                 .and_then(|value| value.parse::<usize>().ok())
         }) {
             config.chunk_size_output_frames = frames;
         }
-        let sidecar = model_dir.join("config.json");
-        if sidecar.exists() {
-            let payload: serde_json::Value = serde_json::from_slice(&fs::read(sidecar)?)?;
-            if let Some(right) = payload.get("right_context").and_then(|v| v.as_u64()) {
-                config.chunk_size_output_frames = right as usize + 1;
-            }
+        if let Some(frames) = selected_frames {
+            config.chunk_size_output_frames = frames;
         }
-        if !matches!(config.chunk_size_output_frames, 7 | 14) {
-            return Err(Error::Model("Supported streaming modes are 560 and 1120 ms".into()));
+        if config.chunk_size_output_frames == 0 {
+            return Err(Error::Model(
+                "streaming chunk frames must be positive".into(),
+            ));
         }
 
         let mut has_prompt = false;
@@ -641,138 +745,153 @@ impl NemotronModel {
         prompt_index: Option<i64>,
     ) -> Result<(Array3<f32>, i64)> {
         self.encoder.with_session_mut(|session| {
-        let features_value = TensorRef::<f32>::from_array_view(features.view())?;
-        let cache_last_channel_value =
-            TensorRef::<f32>::from_array_view(cache.cache_last_channel.view())?;
-        let cache_last_time_value = TensorRef::<f32>::from_array_view(cache.cache_last_time.view())?;
-        let cache_last_channel_len_value =
-            TensorRef::<i64>::from_array_view(cache.cache_last_channel_len.view())?;
+            let features_value = TensorRef::<f32>::from_array_view(features.view())?;
+            let cache_last_channel_value =
+                TensorRef::<f32>::from_array_view(cache.cache_last_channel.view())?;
+            let cache_last_time_value =
+                TensorRef::<f32>::from_array_view(cache.cache_last_time.view())?;
+            let cache_last_channel_len_value =
+                TensorRef::<i64>::from_array_view(cache.cache_last_channel_len.view())?;
 
-        let mut inputs = ort::inputs![
-            "processed_signal" => features_value,
-            "cache_last_channel" => cache_last_channel_value,
-            "cache_last_time" => cache_last_time_value,
-            "cache_last_channel_len" => cache_last_channel_len_value
-        ];
-        let length_arr = [length];
-        if self.has_signal_length_input {
-            let length_value = TensorRef::<i64>::from_array_view(([1usize], &length_arr[..]))?;
-            inputs.push((
-                Cow::Borrowed("processed_signal_length"),
-                SessionInputValue::from(length_value),
-            ));
-        }
-        let prompt_arr = prompt_index.map(|idx| [idx]);
-        if let Some(prompt_arr) = prompt_arr.as_ref() {
-            let prompt_value = TensorRef::<i64>::from_array_view(([1usize], &prompt_arr[..]))?;
-            inputs.push((
-                Cow::Borrowed("prompt_index"),
-                SessionInputValue::from(prompt_value),
-            ));
-        }
-        if self.has_projected_kv_cache {
-            let projected = cache.projected_kv.as_ref().ok_or_else(|| {
-                Error::Model("projected K/V cache graph requires projected cache state".into())
-            })?;
-            let layers = projected.key.shape()[0];
-            for layer in 0..layers {
-                let key = TensorRef::<f32>::from_array_view((
-                    [1usize, projected.key.shape()[2], projected.key.shape()[3]],
-                    projected_layer_slice(&projected.key, layer)?,
-                ))?;
+            let mut inputs = ort::inputs![
+                "processed_signal" => features_value,
+                "cache_last_channel" => cache_last_channel_value,
+                "cache_last_time" => cache_last_time_value,
+                "cache_last_channel_len" => cache_last_channel_len_value
+            ];
+            let length_arr = [length];
+            if self.has_signal_length_input {
+                let length_value = TensorRef::<i64>::from_array_view(([1usize], &length_arr[..]))?;
                 inputs.push((
-                    Cow::Owned(format!("cache_key_layer_{layer}")),
-                    SessionInputValue::from(key),
-                ));
-
-                let value = TensorRef::<f32>::from_array_view((
-                    [1usize, projected.value.shape()[2], projected.value.shape()[3]],
-                    projected_layer_slice(&projected.value, layer)?,
-                ))?;
-                inputs.push((
-                    Cow::Owned(format!("cache_value_layer_{layer}")),
-                    SessionInputValue::from(value),
+                    Cow::Borrowed("processed_signal_length"),
+                    SessionInputValue::from(length_value),
                 ));
             }
-        }
-
-        let outputs = session.run(inputs)?;
-
-        // [1, hidden_dim, time]
-        let (shape, data) = outputs["encoded"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract encoder output: {e}")))?;
-
-        let shape_dims = shape.as_ref();
-        let b = shape_dims[0] as usize;
-        let d = shape_dims[1] as usize;
-        let t = shape_dims[2] as usize;
-
-        let encoder_out = Array3::from_shape_vec((b, d, t), data.to_vec())
-            .map_err(|e| Error::Model(format!("Failed to reshape encoder output: {e}")))?;
-
-        // on here we are extracting encoded length and new cache states.. and so on...
-        let (_, enc_len_data) = outputs["encoded_len"]
-            .try_extract_tensor::<i64>()
-            .map_err(|e| Error::Model(format!("Failed to extract encoded_len: {e}")))?;
-        let encoded_len = enc_len_data[0];
-
-        let (ch_shape, ch_data) = outputs["cache_last_channel_next"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract cache_last_channel: {e}")))?;
-
-        let (tm_shape, tm_data) = outputs["cache_last_time_next"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract cache_last_time: {e}")))?;
-
-        let (len_shape, len_data) = outputs["cache_last_channel_len_next"]
-            .try_extract_tensor::<i64>()
-            .map_err(|e| Error::Model(format!("Failed to extract cache_len: {e}")))?;
-
-        if self.has_projected_kv_cache {
-            let projected = cache.projected_kv.as_mut().ok_or_else(|| {
-                Error::Model("projected K/V cache graph returned outputs but cache state is missing".into())
-            })?;
-            for layer in 0..self.config.num_encoder_layers {
-                let key_name = format!("projected_current_key_layer_{layer}");
-                let value_name = format!("projected_current_value_layer_{layer}");
-                let (key_shape, key_data) = outputs[key_name.as_str()]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| Error::Model(format!("Failed to extract {key_name}: {e}")))?;
-                roll_projected_layer_from_slice(&mut projected.key, layer, key_shape.as_ref(), key_data)?;
-
-                let (value_shape, value_data) = outputs[value_name.as_str()]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| Error::Model(format!("Failed to extract {value_name}: {e}")))?;
-                roll_projected_layer_from_slice(
-                    &mut projected.value,
-                    layer,
-                    value_shape.as_ref(),
-                    value_data,
-                )?;
+            let prompt_arr = prompt_index.map(|idx| [idx]);
+            if let Some(prompt_arr) = prompt_arr.as_ref() {
+                let prompt_value = TensorRef::<i64>::from_array_view(([1usize], &prompt_arr[..]))?;
+                inputs.push((
+                    Cow::Borrowed("prompt_index"),
+                    SessionInputValue::from(prompt_value),
+                ));
             }
-        }
+            if self.has_projected_kv_cache {
+                let projected = cache.projected_kv.as_ref().ok_or_else(|| {
+                    Error::Model("projected K/V cache graph requires projected cache state".into())
+                })?;
+                let layers = projected.key.shape()[0];
+                for layer in 0..layers {
+                    let key = TensorRef::<f32>::from_array_view((
+                        [1usize, projected.key.shape()[2], projected.key.shape()[3]],
+                        projected_layer_slice(&projected.key, layer)?,
+                    ))?;
+                    inputs.push((
+                        Cow::Owned(format!("cache_key_layer_{layer}")),
+                        SessionInputValue::from(key),
+                    ));
 
-        copy_output_to_array4(
-            "cache_last_channel",
-            &mut cache.cache_last_channel,
-            ch_shape.as_ref(),
-            ch_data,
-        )?;
-        copy_output_to_array4(
-            "cache_last_time",
-            &mut cache.cache_last_time,
-            tm_shape.as_ref(),
-            tm_data,
-        )?;
-        copy_output_to_array1_i64(
-            "cache_last_channel_len",
-            &mut cache.cache_last_channel_len,
-            len_shape.as_ref(),
-            len_data,
-        )?;
+                    let value = TensorRef::<f32>::from_array_view((
+                        [
+                            1usize,
+                            projected.value.shape()[2],
+                            projected.value.shape()[3],
+                        ],
+                        projected_layer_slice(&projected.value, layer)?,
+                    ))?;
+                    inputs.push((
+                        Cow::Owned(format!("cache_value_layer_{layer}")),
+                        SessionInputValue::from(value),
+                    ));
+                }
+            }
 
-        Ok((encoder_out, encoded_len))
+            let outputs = session.run(inputs)?;
+
+            // [1, hidden_dim, time]
+            let (shape, data) = outputs["encoded"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract encoder output: {e}")))?;
+
+            let shape_dims = shape.as_ref();
+            let b = shape_dims[0] as usize;
+            let d = shape_dims[1] as usize;
+            let t = shape_dims[2] as usize;
+
+            let encoder_out = Array3::from_shape_vec((b, d, t), data.to_vec())
+                .map_err(|e| Error::Model(format!("Failed to reshape encoder output: {e}")))?;
+
+            // on here we are extracting encoded length and new cache states.. and so on...
+            let (_, enc_len_data) = outputs["encoded_len"]
+                .try_extract_tensor::<i64>()
+                .map_err(|e| Error::Model(format!("Failed to extract encoded_len: {e}")))?;
+            let encoded_len = enc_len_data[0];
+
+            let (ch_shape, ch_data) = outputs["cache_last_channel_next"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract cache_last_channel: {e}")))?;
+
+            let (tm_shape, tm_data) = outputs["cache_last_time_next"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract cache_last_time: {e}")))?;
+
+            let (len_shape, len_data) = outputs["cache_last_channel_len_next"]
+                .try_extract_tensor::<i64>()
+                .map_err(|e| Error::Model(format!("Failed to extract cache_len: {e}")))?;
+
+            if self.has_projected_kv_cache {
+                let projected = cache.projected_kv.as_mut().ok_or_else(|| {
+                    Error::Model(
+                        "projected K/V cache graph returned outputs but cache state is missing"
+                            .into(),
+                    )
+                })?;
+                for layer in 0..self.config.num_encoder_layers {
+                    let key_name = format!("projected_current_key_layer_{layer}");
+                    let value_name = format!("projected_current_value_layer_{layer}");
+                    let (key_shape, key_data) = outputs[key_name.as_str()]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| Error::Model(format!("Failed to extract {key_name}: {e}")))?;
+                    roll_projected_layer_from_slice(
+                        &mut projected.key,
+                        layer,
+                        key_shape.as_ref(),
+                        key_data,
+                    )?;
+
+                    let (value_shape, value_data) = outputs[value_name.as_str()]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| {
+                            Error::Model(format!("Failed to extract {value_name}: {e}"))
+                        })?;
+                    roll_projected_layer_from_slice(
+                        &mut projected.value,
+                        layer,
+                        value_shape.as_ref(),
+                        value_data,
+                    )?;
+                }
+            }
+
+            copy_output_to_array4(
+                "cache_last_channel",
+                &mut cache.cache_last_channel,
+                ch_shape.as_ref(),
+                ch_data,
+            )?;
+            copy_output_to_array4(
+                "cache_last_time",
+                &mut cache.cache_last_time,
+                tm_shape.as_ref(),
+                tm_data,
+            )?;
+            copy_output_to_array1_i64(
+                "cache_last_channel_len",
+                &mut cache.cache_last_channel_len,
+                len_shape.as_ref(),
+                len_data,
+            )?;
+
+            Ok((encoder_out, encoded_len))
         })
     }
 
@@ -794,50 +913,50 @@ impl NemotronModel {
         let state_2_value = TensorRef::<f32>::from_array_view(state_2.view())?;
 
         self.decoder_joint.with_session_mut(|session| {
-        let outputs = session.run(ort::inputs![
-            "encoder_outputs" => encoder_frame_value,
-            "targets" => targets_value,
-            "target_length" => target_len_value,
-            "input_states_1" => state_1_value,
-            "input_states_2" => state_2_value
-        ])?;
+            let outputs = session.run(ort::inputs![
+                "encoder_outputs" => encoder_frame_value,
+                "targets" => targets_value,
+                "target_length" => target_len_value,
+                "input_states_1" => state_1_value,
+                "input_states_2" => state_2_value
+            ])?;
 
-        // logits for others I think you can understand by looking at the error msgs right?
-        let (_l_shape, l_data) = outputs["outputs"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
+            // logits for others I think you can understand by looking at the error msgs right?
+            let (_l_shape, l_data) = outputs["outputs"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
 
-        let logits = Array1::from_vec(l_data.to_vec());
+            let logits = Array1::from_vec(l_data.to_vec());
 
-        let (h_shape, h_data) = outputs["output_states_1"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
+            let (h_shape, h_data) = outputs["output_states_1"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
 
-        let (c_shape, c_data) = outputs["output_states_2"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
+            let (c_shape, c_data) = outputs["output_states_2"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
 
-        let new_state_1 = Array3::from_shape_vec(
-            (
-                h_shape[0] as usize,
-                h_shape[1] as usize,
-                h_shape[2] as usize,
-            ),
-            h_data.to_vec(),
-        )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
+            let new_state_1 = Array3::from_shape_vec(
+                (
+                    h_shape[0] as usize,
+                    h_shape[1] as usize,
+                    h_shape[2] as usize,
+                ),
+                h_data.to_vec(),
+            )
+            .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
 
-        let new_state_2 = Array3::from_shape_vec(
-            (
-                c_shape[0] as usize,
-                c_shape[1] as usize,
-                c_shape[2] as usize,
-            ),
-            c_data.to_vec(),
-        )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
+            let new_state_2 = Array3::from_shape_vec(
+                (
+                    c_shape[0] as usize,
+                    c_shape[1] as usize,
+                    c_shape[2] as usize,
+                ),
+                c_data.to_vec(),
+            )
+            .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
 
-        Ok((logits, new_state_1, new_state_2))
+            Ok((logits, new_state_1, new_state_2))
         })
     }
 }
@@ -845,7 +964,9 @@ impl NemotronModel {
 fn projected_layer_slice(cache: &Array4<f32>, layer: usize) -> Result<&[f32]> {
     let shape = cache.shape();
     if layer >= shape[0] {
-        return Err(Error::Model(format!("projected cache layer out of range: {layer}")));
+        return Err(Error::Model(format!(
+            "projected cache layer out of range: {layer}"
+        )));
     }
     let layer_values = shape[1] * shape[2] * shape[3];
     let start = layer * layer_values;
@@ -859,7 +980,9 @@ fn projected_layer_slice(cache: &Array4<f32>, layer: usize) -> Result<&[f32]> {
 fn projected_layer_slice_mut(cache: &mut Array4<f32>, layer: usize) -> Result<&mut [f32]> {
     let cache_shape = cache.shape();
     if layer >= cache_shape[0] {
-        return Err(Error::Model(format!("projected cache layer out of range: {layer}")));
+        return Err(Error::Model(format!(
+            "projected cache layer out of range: {layer}"
+        )));
     }
     let layer_values = cache_shape[1] * cache_shape[2] * cache_shape[3];
     let start = layer * layer_values;
@@ -907,7 +1030,8 @@ fn roll_projected_layer_from_slice(
     let layer_cache = projected_layer_slice_mut(cache, layer)?;
     for b in 0..batch {
         let cache_batch_start = b * cache_len * hidden;
-        let cache_batch = &mut layer_cache[cache_batch_start..cache_batch_start + cache_len * hidden];
+        let cache_batch =
+            &mut layer_cache[cache_batch_start..cache_batch_start + cache_len * hidden];
         let input_batch_start = b * input_frames * hidden;
         let input_batch = &current[input_batch_start..input_batch_start + input_frames * hidden];
         if current_frames >= cache_len {
@@ -956,12 +1080,49 @@ fn copy_output_to_array4(
 #[cfg(test)]
 mod runtime_lifetime_tests {
     use super::*;
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::{atomic::Ordering, Arc};
+
+    #[test]
+    fn generic_encoder_accepts_each_supported_context() {
+        let payload = serde_json::json!({
+            "right_context": 6,
+            "dynamic_streaming": {
+                "format": 1, "shape_derived_attention_context": true,
+                "subsampling_factor": 8, "mel_frames_overhead": 9,
+                "supported_chunk_frames": [1, 2, 7, 14]
+            }
+        });
+        assert_eq!(streaming_frames_from_config(&payload, None).unwrap(), 7);
+        assert_eq!(streaming_frames_from_config(&payload, Some(7)).unwrap(), 7);
+        assert_eq!(streaming_frames_from_config(&payload, Some(1)).unwrap(), 1);
+        assert_eq!(streaming_frames_from_config(&payload, Some(2)).unwrap(), 2);
+        assert_eq!(
+            streaming_frames_from_config(&payload, Some(14)).unwrap(),
+            14
+        );
+        assert!(streaming_frames_from_config(&payload, Some(8)).is_err());
+    }
+
+    #[test]
+    fn fixed_encoder_cannot_silently_switch_attention_context() {
+        let payload = serde_json::json!({"right_context": 6});
+        assert_eq!(streaming_frames_from_config(&payload, Some(7)).unwrap(), 7);
+        assert!(streaming_frames_from_config(&payload, Some(14)).is_err());
+    }
+
+    #[test]
+    fn malformed_dynamic_contract_is_not_treated_as_fixed() {
+        let payload = serde_json::json!({"right_context": 6, "dynamic_streaming": true});
+        assert!(streaming_frames_from_config(&payload, None).is_err());
+    }
 
     #[test]
     fn backing_bytes_are_freed_when_session_creation_fails() {
         let probe = Arc::new(LifetimeProbe::default());
-        let owner = ModelBytes { data: vec![0_u8; 8].into_boxed_slice(), probe: Some(probe.clone()) };
+        let owner = ModelBytes {
+            data: vec![0_u8; 8].into_boxed_slice(),
+            probe: Some(probe.clone()),
+        };
         let result = DirectOrtSession::try_new(owner, |_| Err::<InMemorySession<'_>, _>("failure"));
         assert!(result.is_err());
         assert_eq!(probe.freed.load(Ordering::SeqCst), 1);
@@ -969,7 +1130,9 @@ mod runtime_lifetime_tests {
 
     #[test]
     fn direct_ort_session_drops_before_its_backing_bytes() {
-        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else { return; };
+        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else {
+            return;
+        };
         let path = PathBuf::from(directory).join("session.ort");
         for _ in 0..3 {
             let probe = Arc::new(LifetimeProbe::default());
@@ -978,14 +1141,18 @@ mod runtime_lifetime_tests {
                 probe: Some(probe.clone()),
             };
             let mut builder = Session::builder().unwrap();
-            let mut cell = DirectOrtSession::try_new(owner,
-                |bytes| builder.commit_from_memory_directly(&bytes.data)).unwrap();
+            let mut cell = DirectOrtSession::try_new(owner, |bytes| {
+                builder.commit_from_memory_directly(&bytes.data)
+            })
+            .unwrap();
             cell.with_dependent_mut(|_, session| {
                 *probe.session.lock().unwrap() = Some(Arc::downgrade(&session.inner()));
                 let data = Array3::<f32>::zeros((1, 128, 65));
-                let outputs = session.run(ort::inputs![
-                    "audio" => TensorRef::from_array_view(data.view()).unwrap()
-                ]).unwrap();
+                let outputs = session
+                    .run(ort::inputs![
+                        "audio" => TensorRef::from_array_view(data.view()).unwrap()
+                    ])
+                    .unwrap();
                 let (_, shape) = outputs["shape"].try_extract_tensor::<i64>().unwrap();
                 assert_eq!(shape, &[1, 128, 65]);
             });
@@ -998,24 +1165,36 @@ mod runtime_lifetime_tests {
 
     #[test]
     fn optimized_cache_separates_dimensions_and_reuses_each_mode() {
-        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else { return; };
+        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else {
+            return;
+        };
         let source = PathBuf::from(directory).join("source.onnx");
-        let cache = std::env::temp_dir().join(format!("wordpipe-cache-test-{}-{}",
-            std::process::id(), std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let cache = std::env::temp_dir().join(format!(
+            "wordpipe-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let mut previous = None;
         for frames in [65_i64, 121, 65] {
             let config = ExecutionConfig::default()
                 .with_ort_optimized_model_cache_dir(&cache)
                 .with_dimension_override("frames", frames);
-            let paths = optimized_model_cache_paths(&config, "encoder", &source).unwrap().unwrap();
-            let mut session = load_session_with_optional_cache(
-                &config, "encoder", &source, "shape-test").unwrap();
+            let paths = optimized_model_cache_paths(&config, "encoder", &source)
+                .unwrap()
+                .unwrap();
+            let mut session =
+                load_session_with_optional_cache(&config, "encoder", &source, "shape-test")
+                    .unwrap();
             session.with_session_mut(|session| {
                 let data = Array3::<f32>::zeros((1, 128, frames as usize));
-                let outputs = session.run(ort::inputs![
-                    "audio" => TensorRef::from_array_view(data.view()).unwrap()
-                ]).unwrap();
+                let outputs = session
+                    .run(ort::inputs![
+                        "audio" => TensorRef::from_array_view(data.view()).unwrap()
+                    ])
+                    .unwrap();
                 let (_, shape) = outputs["shape"].try_extract_tensor::<i64>().unwrap();
                 assert_eq!(shape, &[1, 128, frames]);
             });
