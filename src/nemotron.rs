@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
+use crate::nemotron_frontend::{NemotronFrontend, NemotronMelChunk, NemotronMelChunker};
 use ndarray::{Array1, Array2, Array3};
 use std::fs::File;
 use std::io::Read;
@@ -14,14 +15,8 @@ use std::sync::{Arc, Mutex};
 // https://github.com/NVIDIA-NeMo/NeMo/blob/main/nemo/collections/asr/modules/audio_preprocessing.py
 const SAMPLE_RATE: usize = 16000;
 const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
 const HOP_LENGTH: usize = 160;
 const N_MELS: usize = 128;
-const PREEMPH: f32 = 0.97;
-const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
-
-// Chunk size is derived from the model's output-frame metadata when loaded.
-const PRE_ENCODE_CACHE: usize = 9;
 
 /// Language → prompt embedding index for the multilingual model. Mirrors
 /// `cfg.model_defaults.prompt_dictionary` from the .nemo. Embedded here so
@@ -43,30 +38,126 @@ const PRE_ENCODE_CACHE: usize = 9;
 ///
 /// See: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
 const PROMPT_DICTIONARY: &[(&str, i64)] = &[
-    ("af-ZA", 54), ("am-ET", 49), ("ar", 7), ("ar-AR", 7), ("auto", 101),
-    ("ay-BO", 81), ("az-AZ", 66), ("bg", 30), ("bg-BG", 30), ("bn-IN", 36),
-    ("cs", 22), ("cs-CZ", 22), ("da", 25), ("da-DK", 25), ("de", 9),
-    ("de-DE", 9), ("el", 21), ("el-GR", 21), ("en", 0), ("en-GB", 1),
-    ("en-US", 0), ("enGB", 1), ("es", 3), ("es-ES", 2), ("es-US", 3),
-    ("esES", 2), ("et", 60), ("et-EE", 60), ("fa-IR", 38), ("fi", 26),
-    ("fi-FI", 26), ("fr", 8), ("fr-CA", 100), ("fr-FR", 8), ("gn-PY", 82),
-    ("gu-IN", 42), ("ha-NG", 50), ("haw-US", 97), ("he-IL", 64), ("hi", 6),
-    ("hi-HI", 6), ("hi-IN", 6), ("hr", 29), ("hr-HR", 29), ("hu", 23),
-    ("hu-HU", 23), ("hy-AM", 68), ("id-ID", 34), ("ig-NG", 53), ("it", 15),
-    ("it-IT", 15), ("ja-JA", 10), ("ja-JP", 10), ("ka-GE", 67), ("km-KH", 47),
-    ("kn-IN", 43), ("ko", 14), ("ko-KO", 14), ("ko-KR", 14), ("ku-TR", 65),
-    ("ky-KG", 71), ("ln-CD", 58), ("lt", 31), ("lt-LT", 31), ("lv", 61),
-    ("lv-LV", 61), ("mi-NZ", 96), ("ml-IN", 44), ("mr-IN", 41), ("ms-MY", 35),
-    ("mt-MT", 102), ("nah-MX", 83), ("nb", 103), ("nb-NO", 103), ("ne-NP", 46),
-    ("nl", 16), ("nl-NL", 16), ("nn", 104), ("nn-NO", 104), ("no", 27),
-    ("no-NO", 27), ("ny-MW", 57), ("or-KE", 59), ("pl", 17), ("pl-PL", 17),
-    ("pt", 13), ("pt-BR", 12), ("pt-PT", 13), ("qu-PE", 80), ("ro", 20),
-    ("ro-RO", 20), ("ru", 11), ("ru-RU", 11), ("rw-RW", 55), ("si-LK", 45),
-    ("sk", 28), ("sk-SK", 28), ("sl", 62), ("sl-SI", 62), ("sm-WS", 98),
-    ("so-SO", 56), ("sv", 24), ("sv-SE", 24), ("sw-KE", 48), ("ta-IN", 39),
-    ("te-IN", 40), ("tg-TJ", 70), ("th-TH", 32), ("to-TO", 99), ("tr", 18),
-    ("tr-TR", 18), ("uk", 19), ("uk-UA", 19), ("ur-PK", 37), ("uz-UZ", 69),
-    ("vi-VN", 33), ("yo-NG", 52), ("zh-CN", 4), ("zh-TW", 5), ("zh-ZH", 4),
+    ("af-ZA", 54),
+    ("am-ET", 49),
+    ("ar", 7),
+    ("ar-AR", 7),
+    ("auto", 101),
+    ("ay-BO", 81),
+    ("az-AZ", 66),
+    ("bg", 30),
+    ("bg-BG", 30),
+    ("bn-IN", 36),
+    ("cs", 22),
+    ("cs-CZ", 22),
+    ("da", 25),
+    ("da-DK", 25),
+    ("de", 9),
+    ("de-DE", 9),
+    ("el", 21),
+    ("el-GR", 21),
+    ("en", 0),
+    ("en-GB", 1),
+    ("en-US", 0),
+    ("enGB", 1),
+    ("es", 3),
+    ("es-ES", 2),
+    ("es-US", 3),
+    ("esES", 2),
+    ("et", 60),
+    ("et-EE", 60),
+    ("fa-IR", 38),
+    ("fi", 26),
+    ("fi-FI", 26),
+    ("fr", 8),
+    ("fr-CA", 100),
+    ("fr-FR", 8),
+    ("gn-PY", 82),
+    ("gu-IN", 42),
+    ("ha-NG", 50),
+    ("haw-US", 97),
+    ("he-IL", 64),
+    ("hi", 6),
+    ("hi-HI", 6),
+    ("hi-IN", 6),
+    ("hr", 29),
+    ("hr-HR", 29),
+    ("hu", 23),
+    ("hu-HU", 23),
+    ("hy-AM", 68),
+    ("id-ID", 34),
+    ("ig-NG", 53),
+    ("it", 15),
+    ("it-IT", 15),
+    ("ja-JA", 10),
+    ("ja-JP", 10),
+    ("ka-GE", 67),
+    ("km-KH", 47),
+    ("kn-IN", 43),
+    ("ko", 14),
+    ("ko-KO", 14),
+    ("ko-KR", 14),
+    ("ku-TR", 65),
+    ("ky-KG", 71),
+    ("ln-CD", 58),
+    ("lt", 31),
+    ("lt-LT", 31),
+    ("lv", 61),
+    ("lv-LV", 61),
+    ("mi-NZ", 96),
+    ("ml-IN", 44),
+    ("mr-IN", 41),
+    ("ms-MY", 35),
+    ("mt-MT", 102),
+    ("nah-MX", 83),
+    ("nb", 103),
+    ("nb-NO", 103),
+    ("ne-NP", 46),
+    ("nl", 16),
+    ("nl-NL", 16),
+    ("nn", 104),
+    ("nn-NO", 104),
+    ("no", 27),
+    ("no-NO", 27),
+    ("ny-MW", 57),
+    ("or-KE", 59),
+    ("pl", 17),
+    ("pl-PL", 17),
+    ("pt", 13),
+    ("pt-BR", 12),
+    ("pt-PT", 13),
+    ("qu-PE", 80),
+    ("ro", 20),
+    ("ro-RO", 20),
+    ("ru", 11),
+    ("ru-RU", 11),
+    ("rw-RW", 55),
+    ("si-LK", 45),
+    ("sk", 28),
+    ("sk-SK", 28),
+    ("sl", 62),
+    ("sl-SI", 62),
+    ("sm-WS", 98),
+    ("so-SO", 56),
+    ("sv", 24),
+    ("sv-SE", 24),
+    ("sw-KE", 48),
+    ("ta-IN", 39),
+    ("te-IN", 40),
+    ("tg-TJ", 70),
+    ("th-TH", 32),
+    ("to-TO", 99),
+    ("tr", 18),
+    ("tr-TR", 18),
+    ("uk", 19),
+    ("uk-UA", 19),
+    ("ur-PK", 37),
+    ("uz-UZ", 69),
+    ("vi-VN", 33),
+    ("yo-NG", 52),
+    ("zh-CN", 4),
+    ("zh-TW", 5),
+    ("zh-ZH", 4),
     ("zu-ZA", 51),
 ];
 
@@ -81,11 +172,13 @@ fn is_lang_tag(piece: &str) -> bool {
     let inner = &bytes[1..bytes.len() - 1];
     match inner.len() {
         2 => inner[0].is_ascii_lowercase() && inner[1].is_ascii_lowercase(),
-        5 => inner[0].is_ascii_lowercase()
-            && inner[1].is_ascii_lowercase()
-            && inner[2] == b'-'
-            && inner[3].is_ascii_uppercase()
-            && inner[4].is_ascii_uppercase(),
+        5 => {
+            inner[0].is_ascii_lowercase()
+                && inner[1].is_ascii_lowercase()
+                && inner[2] == b'-'
+                && inner[3].is_ascii_uppercase()
+                && inner[4].is_ascii_uppercase()
+        }
         _ => false,
     }
 }
@@ -327,7 +420,6 @@ pub struct NemotronHandle {
 pub struct Nemotron {
     model: Arc<Mutex<NemotronModel>>,
     vocab: Arc<SentencePieceVocab>,
-    mel_basis: Arc<Array2<f32>>,
     mode: NemotronMode,
     num_encoder_layers: usize,
     hidden_dim: usize,
@@ -342,10 +434,8 @@ pub struct Nemotron {
     last_token: i32,
     /// `None` for English-only mode; `Some(idx)` for multilingual.
     prompt_index: Option<i64>,
-    /// Raw audio sample buffer for proper mel computation
-    audio_buffer: Vec<f32>,
-    /// How many audio samples have been processed (converted to mel and sent to encoder)
-    audio_processed: usize,
+    frontend: NemotronFrontend,
+    mel_chunker: NemotronMelChunker,
     chunk_size: usize,
     chunk_idx: usize,
     accumulated_tokens: Vec<usize>,
@@ -362,10 +452,7 @@ impl NemotronHandle {
     /// The returned handle is cheap to clone and can be used to spawn any
     /// number of [`Nemotron`] instances via [`Nemotron::from_shared`], each
     /// with its own independent decoder state.
-    pub fn load<P: AsRef<Path>>(
-        path: P,
-        exec_config: Option<ExecutionConfig>,
-    ) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P, exec_config: Option<ExecutionConfig>) -> Result<Self> {
         let path = path.as_ref();
 
         let vocab = SentencePieceVocab::from_file(path.join("tokenizer.model"))?;
@@ -470,7 +557,6 @@ impl Nemotron {
         Self {
             model: Arc::clone(&handle.model),
             vocab: Arc::clone(&handle.vocab),
-            mel_basis: Arc::clone(&handle.mel_basis),
             mode: handle.mode,
             num_encoder_layers: handle.num_encoder_layers,
             hidden_dim: handle.hidden_dim,
@@ -484,8 +570,8 @@ impl Nemotron {
             state_2: Array3::zeros((handle.decoder_lstm_layers, 1, handle.decoder_lstm_dim)),
             last_token: handle.blank_id as i32,
             prompt_index,
-            audio_buffer: Vec::new(),
-            audio_processed: 0,
+            frontend: NemotronFrontend::new(Arc::clone(&handle.mel_basis)),
+            mel_chunker: NemotronMelChunker::new(handle.chunk_size),
             chunk_size: handle.chunk_size,
             chunk_idx: 0,
             accumulated_tokens: Vec::new(),
@@ -560,8 +646,8 @@ impl Nemotron {
         self.state_1.fill(0.0);
         self.state_2.fill(0.0);
         self.last_token = self.blank_id as i32;
-        self.audio_buffer.clear();
-        self.audio_processed = 0;
+        self.frontend.reset();
+        self.mel_chunker.reset();
         self.chunk_idx = 0;
         self.accumulated_tokens.clear();
     }
@@ -597,72 +683,11 @@ impl Nemotron {
     /// Transcribe audio samples (non-streaming)
     pub fn transcribe_audio(&mut self, audio: &[f32]) -> Result<String> {
         self.reset();
-
-        let mel = self.compute_mel_spectrogram(audio)?;
-        let total_frames = mel.shape()[1];
-
-        if total_frames == 0 {
-            return Ok(String::new());
+        for packet in audio.chunks(self.chunk_samples()) {
+            self.transcribe_chunk(packet)?;
         }
-
-        let mut all_tokens: Vec<usize> = Vec::new();
-        let mut buffer_idx = 0;
-        let mut chunk_idx = 0;
-
-        while buffer_idx < total_frames {
-            let chunk_end = (buffer_idx + self.chunk_size).min(total_frames);
-            let main_len = chunk_end - buffer_idx;
-
-            let expected_size = PRE_ENCODE_CACHE + self.chunk_size;
-            let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
-
-            // Fill pre-encode cache from previous frames
-            if chunk_idx > 0 && buffer_idx >= PRE_ENCODE_CACHE {
-                let cache_start = buffer_idx - PRE_ENCODE_CACHE;
-                for f in 0..PRE_ENCODE_CACHE {
-                    for m in 0..N_MELS {
-                        chunk_data[m * expected_size + f] = mel[[m, cache_start + f]];
-                    }
-                }
-            }
-
-            // Fill main chunk
-            for f in 0..main_len {
-                for m in 0..N_MELS {
-                    chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] = mel[[m, buffer_idx + f]];
-                }
-            }
-
-            let mel_chunk = Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
-                .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))?;
-
-            let chunk_length = PRE_ENCODE_CACHE + main_len;
-
-            let (encoded, enc_len) = {
-                let mut model = self.model.lock().map_err(|e| {
-                    Error::Model(format!("Failed to acquire model lock: {e}"))
-                })?;
-                model.run_encoder_into(
-                    &mel_chunk,
-                    chunk_length as i64,
-                    &mut self.encoder_cache,
-                    self.prompt_index,
-                )?
-            };
-
-            let new_tokens = self.decode_chunk(&encoded, enc_len as usize)?;
-            all_tokens.extend(new_tokens);
-
-            buffer_idx += self.chunk_size;
-            chunk_idx += 1;
-        }
-
-        let valid_tokens: Vec<usize> = all_tokens
-            .into_iter()
-            .filter(|t| *t < self.vocab_size && !self.lang_tag_ids.contains(t))
-            .collect();
-
-        Ok(self.vocab.decode(&valid_tokens))
+        self.finish()?;
+        Ok(self.get_transcript())
     }
 
     /// Required number of 16 kHz audio samples per streaming chunk.
@@ -672,13 +697,17 @@ impl Nemotron {
 
     /// Stream transcribe a chunk of audio (call repeatedly for real-time).
     ///
-    /// This buffers raw audio and computes mel spectrograms over the full buffer
-    /// to avoid edge effects at chunk boundaries.
+    /// Input may have any packet size. Complete centered windows are produced
+    /// on a global grid; a window needing future samples waits for more audio.
+    /// Call [`Self::finish`] once at end of stream, not with synthetic silence.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<String> {
         Ok(self.transcribe_chunk_internal(audio_chunk, false)?.text)
     }
 
-    pub fn transcribe_chunk_with_trace(&mut self, audio_chunk: &[f32]) -> Result<NemotronChunkTrace> {
+    pub fn transcribe_chunk_with_trace(
+        &mut self,
+        audio_chunk: &[f32],
+    ) -> Result<NemotronChunkTrace> {
         self.transcribe_chunk_internal(audio_chunk, true)
     }
 
@@ -687,110 +716,103 @@ impl Nemotron {
         audio_chunk: &[f32],
         trace_tokens: bool,
     ) -> Result<NemotronChunkTrace> {
-        // Append raw audio to buffer
-        self.audio_buffer.extend_from_slice(audio_chunk);
+        let started = std::time::Instant::now();
+        let frames = self.frontend.push(audio_chunk)?;
+        let chunks = self.mel_chunker.push(frames)?;
+        self.process_mel_chunks(chunks, trace_tokens, started.elapsed().as_secs_f64())
+    }
 
-        // Calculate how many mel frames we can produce from buffered audio
-        // mel_frames = 1 + (audio_len + 2*pad - win_length) / hop_length
-        // For center=true padding, we need at least win_length samples to get 1 frame
-        let total_audio = self.audio_buffer.len();
-        if total_audio < WIN_LENGTH {
+    /// Complete the feature tail using the true audio length and NeMo's masked
+    /// terminal frame. Idempotent; reset before supplying a new stream.
+    pub fn finish(&mut self) -> Result<String> {
+        Ok(self.finish_with_trace_internal(false)?.text)
+    }
+
+    pub fn finish_with_trace(&mut self) -> Result<NemotronChunkTrace> {
+        self.finish_with_trace_internal(true)
+    }
+
+    fn finish_with_trace_internal(&mut self, trace_tokens: bool) -> Result<NemotronChunkTrace> {
+        let started = std::time::Instant::now();
+        let frames = self.frontend.finish()?;
+        if frames.is_empty() || self.frontend.sample_count() == 0 {
             return Ok(NemotronChunkTrace {
                 text: String::new(),
                 decisions: Vec::new(),
             });
         }
+        let mut chunks = self.mel_chunker.push(frames)?;
+        chunks.extend(self.mel_chunker.finish());
+        self.process_mel_chunks(chunks, trace_tokens, started.elapsed().as_secs_f64())
+    }
 
-        // Compute mel spectrogram over the ENTIRE audio buffer
-        let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
-        let total_mel_frames = full_mel.shape()[1];
-
-        // Calculate how many mel frames correspond to processed audio
-        // Each CHUNK_SIZE mel frames = CHUNK_SIZE * HOP_LENGTH audio samples
-        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
-
-        // Check if we have enough NEW frames to process a chunk
-        let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
-        if available_new_frames < self.chunk_size {
-            return Ok(NemotronChunkTrace {
-                text: String::new(),
-                decisions: Vec::new(),
-            });
+    fn process_mel_chunks(
+        &mut self,
+        chunks: Vec<NemotronMelChunk>,
+        trace_tokens: bool,
+        frontend_seconds: f64,
+    ) -> Result<NemotronChunkTrace> {
+        let mut result = NemotronChunkTrace {
+            text: String::new(),
+            decisions: Vec::new(),
+        };
+        let mut first = true;
+        for chunk in chunks {
+            let decoded = self.process_mel_chunk(
+                chunk,
+                trace_tokens,
+                if first { frontend_seconds } else { 0. },
+            )?;
+            first = false;
+            result.text.push_str(&decoded.text);
+            result.decisions.extend(decoded.decisions);
         }
+        Ok(result)
+    }
 
-        // Build encoder input chunk
-        let expected_size = PRE_ENCODE_CACHE + self.chunk_size;
-        let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
-
-        // Determine the mel frame range for this chunk
-        let is_first_chunk = self.chunk_idx == 0;
-        let main_start = processed_mel_frames;
-        let _main_end = main_start + self.chunk_size;
-
-        if is_first_chunk {
-            // First chunk: zero-pad for pre-encode cache
-            for f in 0..self.chunk_size.min(total_mel_frames) {
-                for m in 0..N_MELS {
-                    chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] = full_mel[[m, f]];
-                }
-            }
-        } else {
-            // Subsequent chunks: include pre-encode cache from previous frames
-            let cache_start = main_start.saturating_sub(PRE_ENCODE_CACHE);
-            let cache_frames = main_start - cache_start;
-            let cache_offset = PRE_ENCODE_CACHE - cache_frames;
-
-            // Fill pre-encode cache
-            for f in 0..cache_frames {
-                for m in 0..N_MELS {
-                    chunk_data[m * expected_size + cache_offset + f] =
-                        full_mel[[m, cache_start + f]];
-                }
-            }
-
-            // Fill main chunk
-            for f in 0..self.chunk_size.min(total_mel_frames - main_start) {
-                for m in 0..N_MELS {
-                    chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] =
-                        full_mel[[m, main_start + f]];
-                }
-            }
-        }
-
-        let mel_chunk = Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
-            .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))?;
-
+    fn process_mel_chunk(
+        &mut self,
+        chunk: NemotronMelChunk,
+        trace_tokens: bool,
+        frontend_seconds: f64,
+    ) -> Result<NemotronChunkTrace> {
+        let stage_trace = std::env::var_os("PARAKEET_STAGE_TRACE").is_some();
+        let chunk_started = std::time::Instant::now();
+        let encoder_started = std::time::Instant::now();
         let (encoded, enc_len) = {
-            let mut model = self.model.lock().map_err(|e| {
-                Error::Model(format!("Failed to acquire model lock: {e}"))
-            })?;
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
             model.run_encoder_into(
-                &mel_chunk,
-                expected_size as i64,
+                &chunk.features,
+                chunk.input_frames as i64,
                 &mut self.encoder_cache,
                 self.prompt_index,
             )?
         };
+        let encoder_seconds = encoder_started.elapsed().as_secs_f64();
 
         let chunk_index = self.chunk_idx;
+        let decoder_started = std::time::Instant::now();
         let (tokens, decisions) =
             self.decode_chunk_with_trace(&encoded, enc_len as usize, chunk_index, trace_tokens)?;
+        if stage_trace {
+            eprintln!(
+                "[parakeet-stages] {}",
+                serde_json::json!({
+                    "chunk_index": chunk_index,
+                    "encoder_frames": enc_len,
+                    "frontend_seconds": frontend_seconds,
+                    "encoder_seconds": encoder_seconds,
+                    "decoder_seconds": decoder_started.elapsed().as_secs_f64(),
+                    "total_seconds": chunk_started.elapsed().as_secs_f64(),
+                })
+            );
+        }
         self.accumulated_tokens.extend(&tokens);
 
-        // Advance processed position
-        self.audio_processed += self.chunk_size * HOP_LENGTH;
         self.chunk_idx += 1;
-
-        // Trim audio buffer to keep memory bounded
-        // Keep enough for pre-encode cache context
-        let keep_samples = (PRE_ENCODE_CACHE + self.chunk_size) * HOP_LENGTH + WIN_LENGTH;
-        if self.audio_buffer.len() > keep_samples * 2 {
-            let remove = self.audio_buffer.len() - keep_samples;
-            // Adjust processed counter since we're removing from the start
-            let actual_remove = remove.min(self.audio_processed);
-            self.audio_buffer.drain(0..actual_remove);
-            self.audio_processed -= actual_remove;
-        }
 
         let mut result = String::new();
         for &t in &tokens {
@@ -802,12 +824,6 @@ impl Nemotron {
             text: result,
             decisions,
         })
-    }
-
-    fn decode_chunk(&mut self, encoder_out: &Array3<f32>, enc_frames: usize) -> Result<Vec<usize>> {
-        let (tokens, _) =
-            self.decode_chunk_with_trace(encoder_out, enc_frames, self.chunk_idx, false)?;
-        Ok(tokens)
     }
 
     fn decode_chunk_with_trace(
@@ -828,9 +844,10 @@ impl Nemotron {
 
         // Lock the model once for the entire decode loop to minimise
         // lock acquire/release overhead (many decoder steps per chunk).
-        let mut model = self.model.lock().map_err(|e| {
-            Error::Model(format!("Failed to acquire model lock: {e}"))
-        })?;
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
 
         for t in 0..enc_frames {
             for h in 0..hidden_dim {
@@ -839,12 +856,8 @@ impl Nemotron {
 
             for symbol_index in 0..max_symbols_per_step {
                 let input_token_id = self.last_token;
-                let (logits, new_state_1, new_state_2) = model.run_decoder(
-                    &frame,
-                    input_token_id,
-                    &self.state_1,
-                    &self.state_2,
-                )?;
+                let (logits, new_state_1, new_state_2) =
+                    model.run_decoder(&frame, input_token_id, &self.state_1, &self.state_2)?;
 
                 let mut max_idx = 0;
                 let mut max_val = f32::NEG_INFINITY;
@@ -882,21 +895,6 @@ impl Nemotron {
         }
 
         Ok((tokens, decisions))
-    }
-
-    /// Compute log mel spectrogram WITHOUT normalization.
-    /// I use capitals because this gave me some trouble on the Python side :(). I realized they dont use it later.
-    /// so offc nemo feeding raw log-mel spectrogram values (in decibels) directly to the encoder.
-    fn compute_mel_spectrogram(&self, audio: &[f32]) -> Result<Array2<f32>> {
-        if audio.is_empty() {
-            return Ok(Array2::zeros((N_MELS, 0)));
-        }
-
-        let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&preemph, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel = self.mel_basis.dot(&spec);
-
-        Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))
     }
 }
 

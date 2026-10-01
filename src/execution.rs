@@ -54,6 +54,9 @@ pub struct ModelConfig {
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
+    /// Stop idle ORT pools between Run calls while retaining intra-op spinning.
+    /// Useful when encoder and decoder sessions execute serially.
+    pub force_spinning_stop: bool,
     pub graph_optimization: GraphOptimization,
     pub memory_pattern: Option<bool>,
     pub parallel_execution: bool,
@@ -75,6 +78,7 @@ impl fmt::Debug for ModelConfig {
             .field("execution_provider", &self.execution_provider)
             .field("intra_threads", &self.intra_threads)
             .field("inter_threads", &self.inter_threads)
+            .field("force_spinning_stop", &self.force_spinning_stop)
             .field("graph_optimization", &self.graph_optimization)
             .field("memory_pattern", &self.memory_pattern)
             .field("parallel_execution", &self.parallel_execution)
@@ -105,6 +109,7 @@ impl Default for ModelConfig {
             execution_provider: ExecutionProvider::default(),
             intra_threads: 4,
             inter_threads: 1,
+            force_spinning_stop: false,
             graph_optimization: GraphOptimization::default(),
             memory_pattern: None,
             parallel_execution: false,
@@ -133,6 +138,11 @@ impl ModelConfig {
 
     pub fn with_inter_threads(mut self, threads: usize) -> Self {
         self.inter_threads = threads;
+        self
+    }
+
+    pub fn with_force_spinning_stop(mut self, enabled: bool) -> Self {
+        self.force_spinning_stop = enabled;
         self
     }
 
@@ -233,6 +243,9 @@ impl ModelConfig {
             .with_optimization_level(graph_optimization)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
+        if self.force_spinning_stop {
+            builder = builder.with_config_entry("session.force_spinning_stop", "1")?;
+        }
         for (name, size) in &self.dimension_overrides {
             builder = builder.with_dimension_override(name, *size)?;
         }

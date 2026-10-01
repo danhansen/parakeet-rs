@@ -232,6 +232,10 @@ fn optimized_model_cache_key(
     update_fnv1a(&mut hash, exec_config.inter_threads.to_string().as_bytes());
     update_fnv1a(
         &mut hash,
+        exec_config.force_spinning_stop.to_string().as_bytes(),
+    );
+    update_fnv1a(
+        &mut hash,
         format!("{:?}", exec_config.dimension_overrides).as_bytes(),
     );
     update_fnv1a(
@@ -501,7 +505,9 @@ fn streaming_frames_from_config(
         + 1;
     let frames = requested.unwrap_or(default_frames);
     if frames == 0 || default_frames == 0 {
-        return Err(Error::Model("streaming chunk frames must be positive".into()));
+        return Err(Error::Model(
+            "streaming chunk frames must be positive".into(),
+        ));
     }
     if let Some(dynamic) = payload
         .get("dynamic_streaming")
@@ -1210,6 +1216,25 @@ mod runtime_lifetime_tests {
             }
         }
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn pool_stop_policy_has_a_distinct_cache_key_without_disabling_cache() {
+        let Some(directory) = std::env::var_os("WORDPIPE_ORT_TEST_FIXTURES") else {
+            return;
+        };
+        let source = PathBuf::from(directory).join("source.onnx");
+        let config = ExecutionConfig::default().with_ort_optimized_model_cache_dir(
+            std::env::temp_dir().join("wordpipe-cache-key-only"),
+        );
+        let normal = optimized_model_cache_paths(&config, "encoder", &source)
+            .unwrap()
+            .unwrap();
+        let stopped =
+            optimized_model_cache_paths(&config.with_force_spinning_stop(true), "encoder", &source)
+                .unwrap()
+                .unwrap();
+        assert_ne!(normal.final_path, stopped.final_path);
     }
 }
 
